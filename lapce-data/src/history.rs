@@ -25,7 +25,10 @@ use lapce_xi_rope::{spans::Spans, Rope};
 use crate::{
     command::{LapceUICommand, LAPCE_UI_COMMAND},
     config::{LapceConfig, LapceTheme},
-    document::{BufferContent, Document, TextLayoutCache, TextLayoutLine},
+    document::{
+        BufferContent, DisplayLine, DisplayLineInfo, Document, TextLayoutCache,
+        TextLayoutLine,
+    },
 };
 
 #[derive(Clone)]
@@ -80,10 +83,14 @@ impl DocumentHistory {
         self.retrieve_history_styles(doc);
     }
 
+    pub fn display_line_info(&self, line: DisplayLine) -> Option<DisplayLineInfo> {
+        todo!()
+    }
+
     pub fn get_text_layout(
         &self,
         text: &mut PietText,
-        line: usize,
+        line: DisplayLine,
         config: &LapceConfig,
     ) -> Arc<TextLayoutLine> {
         let font_size = 0;
@@ -118,10 +125,11 @@ impl DocumentHistory {
             .unwrap()
     }
 
-    fn new_text_layout(
+    fn new_real_line_layout(
         &self,
         text: &mut PietText,
         line: usize,
+        break_idx: usize,
         config: &LapceConfig,
     ) -> TextLayoutLine {
         let line_content = self.buffer.as_ref().unwrap().line_content(line);
@@ -156,6 +164,26 @@ impl DocumentHistory {
             extra_style: Vec::new(),
             whitespaces: None,
             indent: 0.0,
+        }
+    }
+
+    fn new_text_layout(
+        &self,
+        text: &mut PietText,
+        display_line: DisplayLine,
+        config: &LapceConfig,
+    ) -> TextLayoutLine {
+        let line_info = self.display_line_info(display_line);
+        match line_info {
+            Some(DisplayLineInfo::Buffer { line, break_idx }) => {
+                self.new_real_line_layout(text, line, break_idx, config)
+            }
+            Some(DisplayLineInfo::Phantom {
+                line,
+                nearest_real_line,
+            }) => todo!(),
+            // TODO: Create empty text layout line instance, which is what the code did before
+            None => todo!(),
         }
     }
 

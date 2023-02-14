@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -78,6 +79,52 @@ impl Clipboard for SystemClipboard {
     }
 }
 
+// TODO: Should we have a `DisplayLineBuffer` that is guaranteed to be somewhere in the buffer?
+
+/// A line in the display.  
+/// This implies that it is not necessarily a line
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DisplayLine(usize);
+impl DisplayLine {
+    /// Construct a [`DisplayLine`] with a given `usize`.  
+    /// This is the intended way to construct a [`DisplayLine`] since it makes it clear that you are
+    /// assuming it is valid.
+    pub fn new_unchecked(line: usize) -> DisplayLine {
+        DisplayLine(line)
+    }
+
+    /// Get the held line number. Note that you should not use this for accessing
+    /// into the buffer! It needs to be mapped to a real line number before usage.
+    pub fn get(&self) -> usize {
+        self.0
+    }
+
+    pub fn get_mut(&mut self) -> &mut usize {
+        &mut self.0
+    }
+}
+
+/// Information about the specific
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DisplayLineInfo {
+    /// A line that actually lies in the buffer
+    Buffer {
+        /// The real underlying line
+        line: usize,
+        /// The index at which the line breaks from the previous text.  
+        /// 0 for the first line, even if it doesn't wrap.
+        break_idx: usize,
+    },
+    Phantom {
+        /// The display line it is at. This will just be the same display line given if you called
+        /// [`Document::display_line_info`]
+        line: DisplayLine,
+        // TODO: I think this can't be zero because the zeroth line would just have normal phantom text
+        /// The nearest actual line above it.  
+        nearest_real_line: usize,
+    },
+}
+
 #[derive(Clone)]
 pub struct LineExtraStyle {
     pub bg_color: Option<Color>,
@@ -103,7 +150,7 @@ pub struct TextLayoutCache {
     /// (Font Size -> (Line Number -> Text Layout))  
     /// Different font-sizes are cached separately, which is useful for features like code lens
     /// where the text becomes small but you may wish to revert quickly.
-    pub layouts: HashMap<usize, HashMap<usize, Arc<TextLayoutLine>>>,
+    pub layouts: HashMap<usize, HashMap<DisplayLine, Arc<TextLayoutLine>>>,
     pub max_width: f64,
 }
 
@@ -400,7 +447,7 @@ pub struct Document {
     /// since we may need to fill it with constructed text layouts.
     pub text_layouts: Rc<RefCell<TextLayoutCache>>,
     /// A cache for the sticky headers which maps a line to the lines it should show in the header.
-    pub sticky_headers: Rc<RefCell<HashMap<usize, Option<Vec<usize>>>>>,
+    pub sticky_headers: Rc<RefCell<HashMap<DisplayLine, Option<Vec<DisplayLine>>>>>,
     /// Whether we've started loading the buffer's content, used for file loading since that
     /// has to be done through a request to the proxy.
     load_started: Rc<RefCell<bool>>,
@@ -747,8 +794,14 @@ impl Document {
         self.histories.get(version)
     }
 
-    pub fn history_visual_line(&self, version: &str, line: usize) -> usize {
+    pub fn history_visual_line(
+        &self,
+        version: &str,
+        line: DisplayLine,
+    ) -> DisplayLine {
         let mut visual_line = 0;
+        // FIXME: This should probably be using an interval or something to test if it is within the diff lines??
+        let real_line = self.display_line_nearest_line_col(line, 0).0;
         if let Some(history) = self.histories.get(version) {
             for (_i, change) in history.changes().iter().enumerate() {
                 match change {
@@ -756,14 +809,14 @@ impl Document {
                         visual_line += range.len();
                     }
                     DiffLines::Both(_, r) | DiffLines::Right(r) => {
-                        if r.contains(&line) {
-                            visual_line += line - r.start;
+                        if r.contains(&real_line) {
+                            visual_line += real_line - r.start;
                             break;
                         }
                         visual_line += r.len();
                     }
                     DiffLines::Skip(_, r) => {
-                        if r.contains(&line) {
+                        if r.contains(&real_line) {
                             break;
                         }
                         visual_line += 1;
@@ -771,7 +824,7 @@ impl Document {
                 }
             }
         }
-        visual_line
+        DisplayLine::new_unchecked(visual_line)
     }
 
     pub fn history_actual_line_from_visual(
@@ -1164,14 +1217,168 @@ impl Document {
         }
     }
 
-    /// Get the phantom text for a given line
+    /// Get information about the display line. Like what line it is in the buffer and break index
+    /// it is at, or if it is a purely phantom line.
+    pub fn display_line_info(&self, line: DisplayLine) -> Option<DisplayLineInfo> {
+        // TODO: actual impl
+        Some(DisplayLineInfo::Buffer {
+            line: line.get(),
+            break_idx: 0,
+        })
+    }
+
+    pub fn display_line_info_to_line(&self, info: DisplayLineInfo) -> DisplayLine {
+        // TODO
+        match info {
+            DisplayLineInfo::Buffer { line, break_idx } => {
+                DisplayLine::new_unchecked(line)
+            }
+            DisplayLineInfo::Phantom { line, .. } => line,
+        }
+    }
+
+    /// Ensures that the [`DisplayLine`] fits within the allowed lines.
+    pub fn constrain_display_line(&self, line: DisplayLine) -> DisplayLine {
+        let info = self.display_line_info(line);
+        match info {
+            Some(DisplayLineInfo::Buffer { line, break_idx }) => {
+                let line = line.min(self.buffer.last_line());
+                self.display_line_info_to_line(DisplayLineInfo::Buffer {
+                    line,
+                    break_idx,
+                })
+            }
+            // No need to modify it
+            Some(DisplayLineInfo::Phantom { .. }) => line,
+            None => self.display_line_info_to_line(DisplayLineInfo::Buffer {
+                line: self.buffer.last_line(),
+                // TODO: clicking after the end of the document should go to the *last* breakage,
+                // since that's the actual display last line
+                break_idx: 0,
+            }),
+        }
+    }
+
+    /// The last display line
+    pub fn display_line_last(&self) -> DisplayLine {
+        todo!()
+    }
+
+    /// Get the [`DisplayLine`] for the given buffer line and column.  
+    /// If possible, it returns the relevant [`DisplayLine`] instance and the new column offset.  
+    /// (Ex: the column can change if the line wraps)
+    pub fn display_line_col(
+        &self,
+        line: usize,
+        col: usize,
+    ) -> Option<(DisplayLine, usize)> {
+        // TODO
+        Some((DisplayLine::new_unchecked(line), col))
+    }
+
+    /// Convert the display line and column (such as gotten from [`Document::line_col_of_point`]))
+    /// into the nearest real line and column in the buffer.
+    pub fn display_line_nearest_line_col(
+        &self,
+        line: DisplayLine,
+        col: usize,
+    ) -> (usize, usize) {
+        // TODO
+        (line.get(), col)
+    }
+
+    // TODO: this function seems kinda weird
+    pub fn display_line_nearest_offset(&self, line: DisplayLine) -> usize {
+        // TODO
+        self.buffer.offset_of_line(line.get())
+    }
+
+    /// Get the column of the end of this display line
+    pub fn display_line_end_col(
+        &self,
+        line: DisplayLine,
+        caret: bool,
+    ) -> Option<usize> {
+        // TODO
+        Some(self.buffer.line_end_col(line.get(), caret))
+    }
+
+    pub fn offset_to_display_line_info(
+        &self,
+        offset: usize,
+    ) -> Option<DisplayLineInfo> {
+        let line = self.offset_to_display_line(offset);
+        line.and_then(|line| self.display_line_info(line))
+    }
+
+    pub fn offset_to_display_line(&self, offset: usize) -> Option<DisplayLine> {
+        // TODO
+        Some(self.offset_to_display_line_col(offset).0)
+    }
+
+    pub fn offset_to_display_line_col(&self, offset: usize) -> (DisplayLine, usize) {
+        // TODO: this should be more complex than just the real line
+        let (line, col) = self.buffer.offset_to_line_col(offset);
+        (DisplayLine::new_unchecked(line), col)
+    }
+
+    /// Returns the column of the first nonblank character on the line.
+    pub fn first_non_blank_character_on_display_line(
+        &self,
+        line: DisplayLine,
+    ) -> Option<usize> {
+        // TODO
+        Some(self.buffer.first_non_blank_character_on_line(line.get()))
+    }
+
+    /// Get the phantom text for a given display line info.  
+    /// This takes the [`DisplayLineInfo`] structure because it is likely already computed by the
+    /// caller.
     pub fn line_phantom_text(
         &self,
         config: &LapceConfig,
-        line: usize,
+        line_info: DisplayLineInfo,
     ) -> PhantomTextLine {
-        let start_offset = self.buffer.offset_of_line(line);
-        let end_offset = self.buffer.offset_of_line(line + 1);
+        let (start_offset, end_offset, target_line) = match line_info {
+            DisplayLineInfo::Buffer { line, break_idx } => {
+                let start_offset = self.buffer.offset_of_line(line);
+                let end_offset = self.buffer.offset_of_line(line + 1);
+                // TODO: We should use the break_idx to get the start/end offsets of that specific wrapped line
+                (start_offset, end_offset, line)
+            }
+            DisplayLineInfo::Phantom {
+                line,
+                nearest_real_line,
+            } => todo!(),
+        };
+
+        fn get_target_content<'a>(
+            text: &'a str,
+            target_line: usize,
+            start_line: usize,
+            end_line: usize,
+        ) -> Option<&'a str> {
+            // TODO: Cut it up based on new lines for phantom lines
+            // this uses end line because that's what diagnostics do, they put it on the last
+            // line that it ranges over
+            if end_line == target_line {
+                Some(text)
+            } else {
+                None
+            }
+        }
+        fn get_target_content_infer_end<'a>(
+            text: &'a str,
+            target_line: usize,
+            start_line: usize,
+        ) -> Option<&'a str> {
+            // Note: lines().count() has "asdf" and "asdf\n" count as 1 line
+            // but "asdf\ndef" counts as 2 lines
+            let end_line = text.lines().count() + start_line;
+            get_target_content(text, target_line, start_line, end_line)
+        }
+
+        // TODO: filter based on relevant line
 
         // If hints are enabled, and the hints field is filled, then get the hints for this line
         // and convert them into PhantomText instances
@@ -1218,6 +1425,8 @@ impl Document {
         // overall.
         let mut text: SmallVec<[PhantomText; 6]> = hints.collect();
 
+        // TODO: Configuration option for whether diagnostics can be multiline
+
         // The max severity is used to determine the color given to the background of the line
         let mut max_severity = None;
         // If error lens is enabled, and the diagnostics field is filled, then get the diagnostics
@@ -1231,11 +1440,17 @@ impl Document {
             .map(|x| x.iter())
             .into_iter()
             .flatten()
-            .filter(|diag| {
-                diag.diagnostic.range.end.line as usize == line
-                    && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
+            .filter(|diag| diag.diagnostic.severity < Some(DiagnosticSeverity::HINT))
+            .filter_map(|diag| {
+                get_target_content(
+                    &diag.diagnostic.message,
+                    target_line,
+                    diag.diagnostic.range.start.line as usize,
+                    diag.diagnostic.range.end.line as usize,
+                )
+                .map(|x| (diag, x))
             })
-            .map(|diag| {
+            .map(|(diag, diag_text)| {
                 match (diag.diagnostic.severity, max_severity) {
                     (Some(severity), Some(max)) => {
                         if severity < max {
@@ -1249,8 +1464,10 @@ impl Document {
                 }
 
                 let rope_text = self.buffer.rope_text();
-                let col = rope_text.offset_of_line(line + 1)
-                    - rope_text.offset_of_line(line);
+                // let col = rope_text.offset_of_line(line + 1)
+                //     - rope_text.offset_of_line(line);
+                // TODO: this col logic probably isn't what we want for phantom lines
+                let col = end_offset - start_offset;
                 let fg = {
                     let severity = diag
                         .diagnostic
@@ -1290,8 +1507,15 @@ impl Document {
             .enable_completion_lens
             .then_some(())
             .and(self.completion.as_ref())
+            .map(|x| x.as_str())
             // TODO: We're probably missing on various useful completion things to include here!
-            .filter(|_| line == completion_line)
+            .and_then(|completion| {
+                get_target_content_infer_end(
+                    completion,
+                    target_line,
+                    completion_line,
+                )
+            })
             .map(|completion| PhantomText {
                 kind: PhantomTextKind::Completion,
                 col: completion_col,
@@ -1313,7 +1537,9 @@ impl Document {
 
         if let Some(ime_text) = self.ime_text.as_ref() {
             let (ime_line, col, _) = self.ime_pos;
-            if line == ime_line {
+            if let Some(ime_text) =
+                get_target_content_infer_end(&ime_text, target_line, ime_line)
+            {
                 text.push(PhantomText {
                     kind: PhantomTextKind::Ime,
                     text: ime_text.to_string(),
@@ -1709,11 +1935,11 @@ impl Document {
         self.line_styles.borrow().get(&line).cloned().unwrap()
     }
 
-    /// Get the (line, col) of a particular point within the editor.
+    /// Get the nearest real (line, col) of a particular point within the editor.
     /// The boolean indicates whether the point is within the text bounds.  
     /// Points outside of vertical bounds will return the last line.
     /// Points outside of horizontal bounds will return the last column on the line.
-    pub fn line_col_of_point(
+    fn nearest_line_col_of_point(
         &self,
         text: &mut PietText,
         mode: Mode,
@@ -1721,6 +1947,7 @@ impl Document {
         view: &EditorView,
         config: &LapceConfig,
     ) -> ((usize, usize), bool) {
+        // Get the display line of the point.
         let (line, font_size) = match view {
             EditorView::Diff(version) => {
                 let changes = self
@@ -1796,36 +2023,58 @@ impl Document {
             ),
         };
 
-        let line = line.min(self.buffer.last_line());
+        // Construct the display line, ensuring it is within bounds.
+        let line = DisplayLine::new_unchecked(line);
+        let line = self.constrain_display_line(line);
+        // TODO: This should probably depend on where it is. Like a point above the document should be at 0, but a point at the end should be at the last line last break idx?
+        let line_info =
+            self.display_line_info(line)
+                .unwrap_or(DisplayLineInfo::Buffer {
+                    line: 0,
+                    break_idx: 0,
+                });
 
         let mut x_shift = 0.0;
-        if font_size < config.editor.font_size {
-            let line_content = self.buffer.line_content(line);
-            let mut col = 0usize;
-            for ch in line_content.chars() {
-                if ch == ' ' || ch == '\t' {
-                    col += 1;
-                } else {
-                    break;
-                }
-            }
+        // TODO: Consider when input font size is smaller than editor font size
+        // if font_size < config.editor.font_size {
+        //     let col = match line_info {
+        //         DisplayLineInfo::Buffer { line, break_idx } => {
+        //             let line_content = self.buffer.line_content(line);
+        //             let mut col = 0usize;
+        //             for ch in line_content.chars() {
+        //                 if ch == ' ' || ch == '\t' {
+        //                     col += 1;
+        //                 } else {
+        //                     break;
+        //                 }
+        //             }
 
-            // If there's indentation, then we look at the difference between the normal text
-            // and the shrunk text to shift the point over.
-            if col > 0 {
-                let normal_text_layout = self.get_text_layout(
-                    text,
-                    line,
-                    config.editor.font_size,
-                    config,
-                );
-                let small_text_layout =
-                    self.get_text_layout(text, line, font_size, config);
-                x_shift =
-                    normal_text_layout.text.hit_test_text_position(col).point.x
-                        - small_text_layout.text.hit_test_text_position(col).point.x;
-            }
-        }
+        //             col
+        //         }
+        //         // TODO: We can do nothing on phantom text, of we could count it as an escape or something for clicking, but we'd need to alert the caller for that
+        //         DisplayLineInfo::Phantom {
+        //             line,
+        //             nearest_real_line,
+        //         } => todo!(),
+        //     };
+
+        //     // If there's indentation, then we look at the difference between the normal text
+        //     // and the shrunk text to shift the point over.
+
+        //     if col > 0 {
+        //         let normal_text_layout = self.get_text_layout(
+        //             text,
+        //             line,
+        //             config.editor.font_size,
+        //             config,
+        //         );
+        //         let small_text_layout =
+        //             self.get_text_layout(text, line, font_size, config);
+        //         x_shift =
+        //             normal_text_layout.text.hit_test_text_position(col).point.x
+        //                 - small_text_layout.text.hit_test_text_position(col).point.x;
+        //     }
+        // }
 
         // Since we have the line, we can do a hit test after shifting the point to be within the
         // line itself
@@ -1835,13 +2084,18 @@ impl Document {
             .hit_test_point(Point::new(point.x - x_shift, 0.0));
         // We have to unapply the phantom text shifting in order to get back to the column in
         // the actual buffer
-        let phantom_text = self.line_phantom_text(config, line);
+        let phantom_text = self.line_phantom_text(config, line_info);
         let col = phantom_text.before_col(hit_point.idx);
+
+        // We need to convert the display line and column into the nearest real line and column
+        let (line, col) = self.display_line_nearest_line_col(line, col);
+
         // Ensure that the column doesn't end up out of bounds, so things like clicking on the far
         // right end will just go to the end of the line.
         let max_col = self.buffer.line_end_col(line, mode != Mode::Normal);
         let mut col = col.min(max_col);
 
+        // TODO: impl this
         if config.editor.atomic_soft_tabs && config.editor.tab_width > 1 {
             col = snap_to_soft_tab_line_col(
                 &self.buffer,
@@ -1855,11 +2109,11 @@ impl Document {
         ((line, col), hit_point.is_inside)
     }
 
-    /// Get the offset of a particular point within the editor.  
+    /// Get the nearest real offset of a particular point within the editor's buffer.  
     /// The boolean indicates whether the point is inside the text or not
     /// Points outside of vertical bounds will return the last line.
     /// Points outside of horizontal bounds will return the last column on the line.
-    pub fn offset_of_point(
+    pub fn nearest_offset_of_point(
         &self,
         text: &mut PietText,
         mode: Mode,
@@ -1868,7 +2122,7 @@ impl Document {
         config: &LapceConfig,
     ) -> (usize, bool) {
         let ((line, col), is_inside) =
-            self.line_col_of_point(text, mode, point, view, config);
+            self.nearest_line_col_of_point(text, mode, point, view, config);
         (self.buffer.offset_of_line_col(line, col), is_inside)
     }
 
@@ -1881,18 +2135,21 @@ impl Document {
         config: &LapceConfig,
     ) -> (Point, Point) {
         let (line, col) = self.buffer.offset_to_line_col(offset);
+        // TODO: don't unwrap
+        let (line, col) = self.display_line_col(line, col).unwrap();
         self.points_of_line_col(text, line, col, view, config)
     }
 
-    /// Get the (point above, point below) of a particular (line, col) within the editor.
+    /// Get the (point above, point below) of a particular (display line, col) within the editor.
     pub fn points_of_line_col(
         &self,
         text: &mut PietText,
-        line: usize,
+        line: DisplayLine,
         col: usize,
         view: &EditorView,
         config: &LapceConfig,
     ) -> (Point, Point) {
+        // TODO: are the modification to these calculations correct?
         let (y, line_height, font_size) = match view {
             EditorView::Diff(version) => {
                 let changes = self
@@ -1908,15 +2165,15 @@ impl Document {
                             y += l.len() * line_height;
                         }
                         DiffLines::Skip(_l, r) => {
-                            if current_line + r.len() > line {
+                            if current_line + r.len() > line.get() {
                                 break;
                             }
                             y += line_height;
                             current_line += r.len();
                         }
                         DiffLines::Both(_, r) | DiffLines::Right(r) => {
-                            if current_line + r.len() > line {
-                                y += line_height * (line - current_line);
+                            if current_line + r.len() > line.get() {
+                                y += line_height * (line.get() - current_line);
                                 break;
                             }
                             y += r.len() * line_height;
@@ -1929,9 +2186,10 @@ impl Document {
             EditorView::Lens => {
                 if let Some(syntax) = self.syntax() {
                     let lens = &syntax.lens;
-                    let height = lens.height_of_line(line);
-                    let line_height =
-                        lens.height_of_line(line + 1) - lens.height_of_line(line);
+                    // FIXME: USING DISPLAY LINE HERE IS CERTAINLY INCORRECT
+                    let height = lens.height_of_line(line.get());
+                    let line_height = lens.height_of_line(line.get() + 1)
+                        - lens.height_of_line(line.get());
                     let font_size = if line_height < config.editor.line_height() {
                         config.editor.code_lens_font_size
                     } else {
@@ -1940,53 +2198,56 @@ impl Document {
                     (height, line_height, font_size)
                 } else {
                     (
-                        config.editor.line_height() * line,
+                        config.editor.line_height() * line.get(),
                         config.editor.line_height(),
                         config.editor.font_size,
                     )
                 }
             }
             EditorView::Normal => (
-                config.editor.line_height() * line,
+                config.editor.line_height() * line.get(),
                 config.editor.line_height(),
                 config.editor.font_size,
             ),
         };
 
-        let line = line.min(self.buffer.last_line());
+        let line = self.constrain_display_line(line);
+        // TODO: DOn't unwrap
+        let line_info = self.display_line_info(line).unwrap();
 
-        let phantom_text = self.line_phantom_text(config, line);
+        let phantom_text = self.line_phantom_text(config, line_info);
         let col = phantom_text.col_after(col, false);
 
         let mut x_shift = 0.0;
-        if font_size < config.editor.font_size {
-            let line_content = self.buffer.line_content(line);
-            let mut col = 0usize;
-            for ch in line_content.chars() {
-                if ch == ' ' || ch == '\t' {
-                    col += 1;
-                } else {
-                    break;
-                }
-            }
+        // TODO:
+        // if font_size < config.editor.font_size {
+        //     let line_content = self.buffer.line_content(line);
+        //     let mut col = 0usize;
+        //     for ch in line_content.chars() {
+        //         if ch == ' ' || ch == '\t' {
+        //             col += 1;
+        //         } else {
+        //             break;
+        //         }
+        //     }
 
-            if col > 0 {
-                let normal_text_layout = self.get_text_layout(
-                    text,
-                    line,
-                    config.editor.font_size,
-                    config,
-                );
-                let small_text_layout =
-                    self.get_text_layout(text, line, font_size, config);
-                x_shift =
-                    normal_text_layout.text.hit_test_text_position(col).point.x
-                        - small_text_layout.text.hit_test_text_position(col).point.x;
-            }
-        }
+        //     if col > 0 {
+        //         let normal_text_layout = self.get_text_layout(
+        //             text,
+        //             line,
+        //             config.editor.font_size,
+        //             config,
+        //         );
+        //         let small_text_layout =
+        //             self.get_text_layout(text, line, font_size, config);
+        //         x_shift =
+        //             normal_text_layout.text.hit_test_text_position(col).point.x
+        //                 - small_text_layout.text.hit_test_text_position(col).point.x;
+        //     }
+        // }
 
         let x = self
-            .line_point_of_line_col(text, line, col, font_size, config)
+            .line_point_of_display_line_col(text, line, col, font_size, config)
             .x
             + x_shift;
         (
@@ -2067,6 +2328,26 @@ impl Document {
         font_size: usize,
         config: &LapceConfig,
     ) -> Point {
+        // TODO: is this the proper default value?
+        let (display_line, col) = self
+            .display_line_col(line, col)
+            .unwrap_or_else(|| (self.display_line_last(), 0));
+        let text_layout =
+            self.get_text_layout(text, display_line, font_size, config);
+        text_layout.text.hit_test_text_position(col).point
+    }
+
+    /// Returns the point into the text layout of the line at the given display line and column.
+    /// `x` being the leading edge of the character, and `y` being the baseline.
+    pub fn line_point_of_display_line_col(
+        &self,
+        text: &mut PietText,
+        line: DisplayLine,
+        col: usize,
+        font_size: usize,
+        config: &LapceConfig,
+    ) -> Point {
+        // TODO: is this really what you want most of the time? Won't col be into the phantom text as well or something?
         let text_layout = self.get_text_layout(text, line, font_size, config);
         text_layout.text.hit_test_text_position(col).point
     }
@@ -2076,7 +2357,7 @@ impl Document {
     pub fn get_text_layout(
         &self,
         text: &mut PietText,
-        line: usize,
+        line: DisplayLine,
         font_size: usize,
         config: &LapceConfig,
     ) -> Arc<TextLayoutLine> {
@@ -2125,15 +2406,17 @@ impl Document {
             .unwrap()
     }
 
-    /// Create a new text layout for the given line.  
-    /// Typically you should use [`Document::get_text_layout`] instead.
-    fn new_text_layout(
+    fn new_real_line_layout(
         &self,
         text: &mut PietText,
         line: usize,
+        break_idx: usize,
         font_size: usize,
         config: &LapceConfig,
     ) -> TextLayoutLine {
+        let line_info = DisplayLineInfo::Buffer { line, break_idx };
+
+        // FIXME: use break_idx for wrapping
         let line_content_original = self.buffer.line_content(line);
 
         // Get the line content with newline characters replaced with spaces
@@ -2156,7 +2439,7 @@ impl Document {
                 )
             };
         // Combine the phantom text with the line content
-        let phantom_text = self.line_phantom_text(config, line);
+        let phantom_text = self.line_phantom_text(config, line_info);
         let line_content = phantom_text.combine_with_text(line_content);
 
         let tab_width =
@@ -2294,6 +2577,12 @@ impl Document {
         };
 
         let indent = if indent_line != line {
+            // TODO: this is incorrect probably
+            let indent_line =
+                self.display_line_info_to_line(DisplayLineInfo::Buffer {
+                    line: indent_line,
+                    break_idx: 0,
+                });
             self.get_text_layout(text, indent_line, font_size, config)
                 .indent
                 + 1.0
@@ -2308,6 +2597,29 @@ impl Document {
             extra_style,
             whitespaces: new_whitespaces,
             indent,
+        }
+    }
+
+    /// Create a new text layout for the given line.  
+    /// Typically you should use [`Document::get_text_layout`] instead.
+    fn new_text_layout(
+        &self,
+        text: &mut PietText,
+        display_line: DisplayLine,
+        font_size: usize,
+        config: &LapceConfig,
+    ) -> TextLayoutLine {
+        let line_info = self.display_line_info(display_line);
+        match line_info {
+            Some(DisplayLineInfo::Buffer { line, break_idx }) => {
+                self.new_real_line_layout(text, line, break_idx, font_size, config)
+            }
+            Some(DisplayLineInfo::Phantom {
+                line,
+                nearest_real_line,
+            }) => todo!(),
+            // TODO: Create empty text layout line instance, which is what the code did before
+            None => todo!(),
         }
     }
 
@@ -2392,8 +2704,14 @@ impl Document {
     ) -> usize {
         match *horiz {
             ColPosition::Col(x) => {
+                // TODO: The callers are basically only for real lines for moving down at the right visual position. Those should typically (though maybe with a config option) move to wrapped lines too rather than skipping over them!
+                let display_line =
+                    self.display_line_info_to_line(DisplayLineInfo::Buffer {
+                        line,
+                        break_idx: 0,
+                    });
                 let text_layout =
-                    self.get_text_layout(text, line, font_size, config);
+                    self.get_text_layout(text, display_line, font_size, config);
                 let n = text_layout.text.hit_test_point(Point::new(x, 0.0)).idx;
                 n.min(self.buffer.line_end_col(line, caret))
             }
@@ -3063,17 +3381,23 @@ impl Document {
         }
     }
 
+    // TODO: This should maybe be using displaylines??
     /// Get the sticky headers for a particular line, creating them if necessary.
-    pub fn sticky_headers(&self, line: usize) -> Option<Vec<usize>> {
+    pub fn sticky_headers(&self, line: DisplayLine) -> Option<Vec<DisplayLine>> {
         if let Some(lines) = self.sticky_headers.borrow().get(&line) {
             return lines.clone();
         }
-        let offset = self.buffer.offset_of_line(line + 1);
+        // TODO: this probably isn't correct
+        // let offset = self.buffer.offset_of_line(line + 1);
+        let line_after = DisplayLine::new_unchecked(line.get() + 1);
+        let offset = self.display_line_nearest_offset(line_after);
         let lines = self.syntax.as_ref()?.sticky_headers(offset).map(|offsets| {
             offsets
                 .iter()
                 .filter_map(|offset| {
-                    let l = self.buffer.line_of_offset(*offset);
+                    // TODO: is this correct?
+                    let l = self.offset_to_display_line(*offset)?;
+                    // let l = self.buffer.line_of_offset(*offset);
                     if l <= line {
                         Some(l)
                     } else {

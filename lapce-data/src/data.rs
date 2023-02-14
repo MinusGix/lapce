@@ -60,7 +60,7 @@ use crate::{
         EditorInfo, EditorTabChildInfo, EditorTabInfo, LapceDb, SplitContentInfo,
         SplitInfo, TabsInfo, WindowInfo, WorkspaceInfo,
     },
-    document::{BufferContent, Document, LocalBufferKind},
+    document::{BufferContent, DisplayLine, Document, LocalBufferKind},
     editor::{EditorLocation, EditorPosition, LapceEditorBufferData, Line, TabRect},
     explorer::FileExplorerData,
     find::Find,
@@ -4379,7 +4379,7 @@ impl EditorView {
 #[derive(Debug)]
 pub struct StickyHeaderInfo {
     pub height: f64,
-    pub lines: Vec<usize>,
+    pub lines: Vec<DisplayLine>,
     pub last_y_diff: f64,
 }
 

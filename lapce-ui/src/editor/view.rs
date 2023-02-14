@@ -480,14 +480,18 @@ impl LapceEditorView {
 
     fn cursor_region(data: &LapceEditorBufferData, text: &mut PietText) -> Rect {
         let offset = data.editor.cursor.offset();
-        let (line, col) = data.doc.buffer().offset_to_line_col(offset);
-        let inlay_hints = data.doc.line_phantom_text(&data.config, line);
+        // let (line, col) = data.doc.buffer().offset_to_line_col(offset);
+        let (line, col) = data.doc.offset_to_display_line_col(offset);
+        // TODO: don't unwrap
+        let line_info = data.doc.display_line_info(line).unwrap();
+
+        let inlay_hints = data.doc.line_phantom_text(&data.config, line_info);
         let col = inlay_hints.col_after(col, false);
 
         let width = data.config.editor_char_width(text);
         let cursor_x = data
             .doc
-            .line_point_of_line_col(
+            .line_point_of_display_line_col(
                 text,
                 line,
                 col,
@@ -512,21 +516,27 @@ impl LapceEditorView {
                 match normal_lines.next() {
                     Some(next_normal_line) => {
                         let next_normal_line = *next_normal_line;
+                        // TODO: this is incorrect. Should maybe be using an interval of the display lines that we'd get??
+                        let next_normal_line = data
+                            .doc
+                            .display_line_col(next_normal_line, 0)
+                            .unwrap()
+                            .0;
                         if next_normal_line < line {
                             let chunk_height = data.config.editor.code_lens_font_size
                                 as f64
-                                * (next_normal_line - current_line) as f64
+                                * (next_normal_line.get() - current_line) as f64
                                 + line_height;
                             y += chunk_height;
-                            current_line = next_normal_line + 1;
+                            current_line = next_normal_line.get() + 1;
                             continue;
                         };
-                        y += (line - current_line) as f64
+                        y += (line.get() - current_line) as f64
                             * data.config.editor.code_lens_font_size as f64;
                         break;
                     }
                     None => {
-                        y += (line - current_line) as f64
+                        y += (line.get() - current_line) as f64
                             * data.config.editor.code_lens_font_size as f64;
                         break;
                     }
@@ -539,7 +549,7 @@ impl LapceEditorView {
             } else {
                 line
             };
-            line as f64 * line_height
+            line.get() as f64 * line_height
         };
 
         let surrounding_lines_height =

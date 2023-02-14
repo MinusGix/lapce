@@ -1356,7 +1356,7 @@ impl LapceEditorBufferData {
         mouse_event: &MouseEvent,
         config: &LapceConfig,
     ) {
-        let (new_offset, _) = self.doc.offset_of_point(
+        let (new_offset, _) = self.doc.nearest_offset_of_point(
             ctx.text(),
             self.get_mode(),
             mouse_event.pos,
@@ -1401,7 +1401,7 @@ impl LapceEditorBufferData {
         config: &LapceConfig,
     ) {
         ctx.set_active(true);
-        let (mouse_offset, _) = self.doc.offset_of_point(
+        let (mouse_offset, _) = self.doc.nearest_offset_of_point(
             ctx.text(),
             self.get_mode(),
             mouse_event.pos,
@@ -1425,7 +1425,7 @@ impl LapceEditorBufferData {
         config: &LapceConfig,
     ) {
         ctx.set_active(true);
-        let (mouse_offset, _) = self.doc.offset_of_point(
+        let (mouse_offset, _) = self.doc.nearest_offset_of_point(
             ctx.text(),
             self.get_mode(),
             mouse_event.pos,

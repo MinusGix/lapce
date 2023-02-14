@@ -645,7 +645,8 @@ impl LapceEditorGutter {
                 ctx.clip(rect);
                 let text_layout = ctx
                     .text()
-                    .new_text_layout((line + 1).to_string())
+                    // TODO: We should probably only paint line numbers for real lines??
+                    .new_text_layout((line.get() + 1).to_string())
                     .font(
                         data.config.editor.font_family(),
                         data.config.editor.font_size as f64,

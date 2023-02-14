@@ -21,7 +21,7 @@ use lapce_data::{
     },
     config::{LapceConfig, LapceTheme},
     data::{EditorView, LapceData, LapceTabData},
-    document::{BufferContent, LocalBufferKind},
+    document::{BufferContent, DisplayLine, LocalBufferKind},
     editor::{LapceEditorBufferData, Syntax},
     history::DocumentHistory,
     hover::HoverStatus,
@@ -43,8 +43,8 @@ pub mod tab_header_content;
 pub mod view;
 
 struct ScreenLines {
-    lines: Vec<usize>,
-    info: HashMap<usize, LineInfo>,
+    lines: Vec<DisplayLine>,
+    info: HashMap<DisplayLine, LineInfo>,
 }
 
 struct LineInfo {
@@ -173,7 +173,7 @@ impl LapceEditor {
         }
 
         if ctx.is_active() {
-            let (new_offset, _) = editor_data.doc.offset_of_point(
+            let (new_offset, _) = editor_data.doc.nearest_offset_of_point(
                 ctx.text(),
                 editor_data.get_mode(),
                 mouse_pos,
@@ -185,7 +185,7 @@ impl LapceEditor {
             return;
         }
 
-        let (offset, is_inside) = editor_data.doc.offset_of_point(
+        let (offset, is_inside) = editor_data.doc.nearest_offset_of_point(
             ctx.text(),
             Mode::Insert,
             mouse_pos,
@@ -275,7 +275,7 @@ impl LapceEditor {
         mouse_event: &MouseEvent,
         config: &LapceConfig,
     ) {
-        let (offset, _) = editor_data.doc.offset_of_point(
+        let (offset, _) = editor_data.doc.nearest_offset_of_point(
             ctx.text(),
             editor_data.get_mode(),
             mouse_event.pos,
@@ -511,7 +511,7 @@ impl LapceEditor {
                     data.doc
                         .get_text_layout(
                             text,
-                            0,
+                            DisplayLine::new_unchecked(0),
                             data.config.editor.font_size,
                             &data.config,
                         )
@@ -527,7 +527,7 @@ impl LapceEditor {
                     data.doc
                         .get_text_layout(
                             text,
-                            0,
+                            DisplayLine::new_unchecked(0),
                             data.config.editor.font_size,
                             &data.config,
                         )
@@ -584,6 +584,7 @@ impl LapceEditor {
         let mut lines = Vec::new();
         let mut info = HashMap::new();
         for (line, line_height) in lens.iter_chunks(start_line..end_line + 1) {
+            let line = DisplayLine::new_unchecked(line);
             if let Some(line_content) = lines_iter.next() {
                 let is_small = line_height < data.config.editor.line_height();
                 let mut x = 0.0;
@@ -668,6 +669,7 @@ impl LapceEditor {
         let mut line = 0;
         let mut lines = Vec::new();
         let mut info = HashMap::new();
+        // TODO: this is probably not using display lines correctly. really the changes should be considered real lines and then turned into display lines?
         for change in history.changes().iter() {
             match change {
                 DiffLines::Left(range) => {
@@ -692,6 +694,8 @@ impl LapceEditor {
                             continue;
                         }
                         let actual_line = l - (line - len) + range.start;
+                        // TODO: this should be done for a *range* of lines so it encapsulates the wrapped lines!
+                        let actual_line = DisplayLine::new_unchecked(actual_line);
                         let text_layout = history.get_text_layout(
                             ctx.text(),
                             actual_line,
@@ -762,7 +766,8 @@ impl LapceEditor {
                             continue;
                         }
                         let rope_line = l - (line - len) + right.start;
-
+                        // TODO: this should be done for a *range* of lines so it encapsulates the wrapped lines!
+                        let rope_line = DisplayLine::new_unchecked(rope_line);
                         lines.push(rope_line);
                         info.insert(
                             rope_line,
@@ -803,7 +808,8 @@ impl LapceEditor {
                             continue;
                         }
                         let rope_line = l - (line - len) + range.start;
-
+                        // TODO: this should be done for a *range* of lines so it encapsulates the wrapped lines!
+                        let rope_line = DisplayLine::new_unchecked(rope_line);
                         lines.push(rope_line);
                         info.insert(
                             rope_line,
@@ -856,13 +862,14 @@ impl LapceEditor {
                 let mut lines = Vec::new();
                 let mut info = HashMap::new();
                 for line in start_line..end_line + 1 {
+                    let line = DisplayLine::new_unchecked(line);
                     lines.push(line);
                     info.insert(
                         line,
                         LineInfo {
                             font_size,
                             x: 0.0,
-                            y: line as f64 * line_height + line_padding,
+                            y: line.get() as f64 * line_height + line_padding,
                             line_height,
                         },
                     );
@@ -1006,10 +1013,16 @@ impl LapceEditor {
 
         for line in &screen_lines.lines {
             let line = *line;
-            let last_line = data.doc.buffer().last_line();
-            if line > last_line {
+            // let last_line = data.doc.buffer().last_line();
+            // TODO: is this correct?
+            let last_line = data.doc.constrain_display_line(line);
+            // If it changed to a different line after constraining it, then we're done
+            if line != last_line {
                 break;
             }
+            // if line > last_line {
+            //     break;
+            // }
 
             let info = screen_lines.info.get(&line).unwrap();
             let text_layout = data.doc.get_text_layout(
@@ -1095,7 +1108,8 @@ impl LapceEditor {
         block: bool,
     ) {
         let (line, col) = data.doc.buffer().offset_to_line_col(offset);
-        let phantom_text = data.doc.line_phantom_text(&data.config, line);
+        let line_info = data.doc.offset_to_display_line_info(offset).unwrap();
+        let phantom_text = data.doc.line_phantom_text(&data.config, line_info);
 
         // Shift it by the inlay hints
         let col = if block {
@@ -1117,6 +1131,7 @@ impl LapceEditor {
             })
             .unwrap_or(col);
 
+        // TODO: this should probably be using the y parameter?
         let x0 = data
             .doc
             .line_point_of_line_col(ctx.text(), line, col, font_size, &data.config)
@@ -1175,7 +1190,8 @@ impl LapceEditor {
         let self_size = ctx.size();
         match &data.editor.cursor.mode {
             CursorMode::Normal(offset) => {
-                let (cursor_line, _) = data.doc.buffer().offset_to_line_col(*offset);
+                // let (cursor_line, _) = data.doc.buffer().offset_to_line_col(*offset);
+                let cursor_line = data.doc.offset_to_display_line(*offset).unwrap();
                 if let Some(info) = screen_lines.info.get(&cursor_line) {
                     ctx.fill(
                         Rect::ZERO
@@ -1193,13 +1209,20 @@ impl LapceEditor {
                 }
                 let start_line = *screen_lines.lines.first().unwrap();
                 let end_line = *screen_lines.lines.last().unwrap();
-                let start = data.doc.buffer().offset_of_line(start_line);
-                let end = data.doc.buffer().offset_of_line(end_line + 1);
+                let start = data.doc.display_line_nearest_offset(start_line);
+                // TODO: Should we be constructing a display line like this?
+                let end = data.doc.display_line_nearest_offset(
+                    DisplayLine::new_unchecked(end_line.get() + 1),
+                );
+                // let start = data.doc.buffer().offset_of_line(start_line);
+                // let end = data.doc.buffer().offset_of_line(end_line + 1);
                 let regions = selection.regions_in_range(start, end);
                 for region in regions {
                     let cursor_offset = region.end;
-                    let (cursor_line, _) =
-                        data.doc.buffer().offset_to_line_col(cursor_offset);
+                    // let (cursor_line, _) =
+                    //     data.doc.buffer().offset_to_line_col(cursor_offset);
+                    let cursor_line =
+                        data.doc.offset_to_display_line(cursor_offset).unwrap();
                     if let Some(info) = screen_lines.info.get(&cursor_line) {
                         ctx.fill(
                             Rect::ZERO
@@ -1230,8 +1253,10 @@ impl LapceEditor {
         match &data.editor.cursor.mode {
             CursorMode::Normal(offset) => {
                 if is_focused {
-                    let (cursor_line, _) =
-                        data.doc.buffer().offset_to_line_col(*offset);
+                    // let (cursor_line, _) =
+                    //     data.doc.buffer().offset_to_line_col(*offset);
+                    let cursor_line =
+                        data.doc.offset_to_display_line(*offset).unwrap();
                     if let Some(info) = screen_lines.info.get(&cursor_line) {
                         Self::paint_cursor_caret(
                             ctx,
@@ -1252,11 +1277,16 @@ impl LapceEditor {
                     return;
                 }
 
+                // let (start_line, start_col) =
+                //     data.doc.buffer().offset_to_line_col(*start.min(end));
+                // let (end_line, end_col) =
+                //     data.doc.buffer().offset_to_line_col(*start.max(end));
                 let (start_line, start_col) =
-                    data.doc.buffer().offset_to_line_col(*start.min(end));
+                    data.doc.offset_to_display_line_col(*start.min(end));
                 let (end_line, end_col) =
-                    data.doc.buffer().offset_to_line_col(*start.max(end));
-                let (cursor_line, _) = data.doc.buffer().offset_to_line_col(*end);
+                    data.doc.offset_to_display_line_col(*start.max(end));
+                // TODO: DOn't unwrap
+                let cursor_line = data.doc.offset_to_display_line(*end).unwrap();
                 for line in &screen_lines.lines {
                     let line = *line;
                     if line < start_line {
@@ -1278,8 +1308,11 @@ impl LapceEditor {
                         }
                         VisualMode::Linewise => 0,
                         VisualMode::Blockwise => {
+                            // TODO: DOn't unwrap
                             let max_col =
-                                data.doc.buffer().line_end_col(line, false);
+                                data.doc.display_line_end_col(line, false).unwrap();
+                            // let max_col =
+                            //     data.doc.buffer().line_end_col(line, false);
                             let left = start_col.min(end_col);
                             if left > max_col {
                                 continue;
@@ -1290,10 +1323,10 @@ impl LapceEditor {
 
                     let (right_col, line_end) = match mode {
                         VisualMode::Normal => {
+                            // TODO: DOn't unwrap
+                            let max_col =
+                                data.doc.display_line_end_col(line, true).unwrap();
                             if line == end_line {
-                                let max_col =
-                                    data.doc.buffer().line_end_col(line, true);
-
                                 let end_offset = data.doc.buffer().move_right(
                                     *start.max(end),
                                     Mode::Visual,
@@ -1304,14 +1337,19 @@ impl LapceEditor {
 
                                 (end_col.min(max_col), false)
                             } else {
-                                (data.doc.buffer().line_end_col(line, true), true)
+                                (max_col, true)
                             }
                         }
                         VisualMode::Linewise => {
-                            (data.doc.buffer().line_end_col(line, true), true)
+                            // TODO: DOn't unwrap
+                            let max_col =
+                                data.doc.display_line_end_col(line, true).unwrap();
+                            (max_col, true)
                         }
                         VisualMode::Blockwise => {
-                            let max_col = data.doc.buffer().line_end_col(line, true);
+                            // let max_col = data.doc.buffer().line_end_col(line, true);
+                            let max_col =
+                                data.doc.display_line_end_col(line, true).unwrap();
                             let right = match data.editor.cursor.horiz.as_ref() {
                                 Some(&ColPosition::End) => max_col,
                                 _ => {
@@ -1331,13 +1369,15 @@ impl LapceEditor {
                         }
                     };
 
+                    // TODO: Don't unwrap
+                    let line_info = data.doc.display_line_info(line).unwrap();
                     let phantom_text =
-                        data.doc.line_phantom_text(&data.config, line);
+                        data.doc.line_phantom_text(&data.config, line_info);
                     let left_col = phantom_text.col_after(left_col, false);
                     let right_col = phantom_text.col_after(right_col, false);
                     let x0 = data
                         .doc
-                        .line_point_of_line_col(
+                        .line_point_of_display_line_col(
                             ctx.text(),
                             line,
                             left_col,
@@ -1347,7 +1387,7 @@ impl LapceEditor {
                         .x;
                     let mut x1 = data
                         .doc
-                        .line_point_of_line_col(
+                        .line_point_of_display_line_col(
                             ctx.text(),
                             line,
                             right_col,
@@ -1387,19 +1427,30 @@ impl LapceEditor {
                 }
                 let start_line = *screen_lines.lines.first().unwrap();
                 let end_line = *screen_lines.lines.last().unwrap();
-                let start = data.doc.buffer().offset_of_line(start_line);
-                let end = data.doc.buffer().offset_of_line(end_line + 1);
+                let start = data.doc.display_line_nearest_offset(start_line);
+                // TODO: Is there a way to do this without construction of a new display line?
+                let end = data.doc.display_line_nearest_offset(
+                    DisplayLine::new_unchecked(end_line.get() + 1),
+                );
+                // let start = data.doc.buffer().offset_of_line(start_line);
+                // let end = data.doc.buffer().offset_of_line(end_line + 1);
                 let regions = selection.regions_in_range(start, end);
                 for region in regions {
                     let cursor_offset = region.end;
+                    // let (cursor_line, _) =
+                    //     data.doc.buffer().offset_to_line_col(cursor_offset);
                     let (cursor_line, _) =
-                        data.doc.buffer().offset_to_line_col(cursor_offset);
+                        data.doc.offset_to_display_line_col(cursor_offset);
                     let start = region.start;
                     let end = region.end;
+                    // let (start_line, start_col) =
+                    //     data.doc.buffer().offset_to_line_col(start.min(end));
+                    // let (end_line, end_col) =
+                    //     data.doc.buffer().offset_to_line_col(start.max(end));
                     let (start_line, start_col) =
-                        data.doc.buffer().offset_to_line_col(start.min(end));
+                        data.doc.offset_to_display_line_col(start.min(end));
                     let (end_line, end_col) =
-                        data.doc.buffer().offset_to_line_col(start.max(end));
+                        data.doc.offset_to_display_line_col(start.max(end));
                     for line in &screen_lines.lines {
                         let line = *line;
                         if line < start_line {
@@ -1415,17 +1466,22 @@ impl LapceEditor {
                             _ if line == start_line => start_col,
                             _ => 0,
                         };
+                        // TODO: Don't unwrap
+                        let max_col =
+                            data.doc.display_line_end_col(line, true).unwrap();
                         let (right_col, line_end) = match line {
                             _ if line == end_line => {
-                                let max_col =
-                                    data.doc.buffer().line_end_col(line, true);
+                                // let max_col =
+                                //     data.doc.buffer().line_end_col(line, true);
                                 (end_col.min(max_col), false)
                             }
-                            _ => (data.doc.buffer().line_end_col(line, true), true),
+                            _ => (max_col, true),
                         };
 
+                        // TODO: Don't unwrap
+                        let line_info = data.doc.display_line_info(line).unwrap();
                         let phantom_text =
-                            data.doc.line_phantom_text(&data.config, line);
+                            data.doc.line_phantom_text(&data.config, line_info);
 
                         // Shift it by the inlay hints
                         let left_col = phantom_text.col_after(left_col, false);
@@ -1433,7 +1489,7 @@ impl LapceEditor {
 
                         let x0 = data
                             .doc
-                            .line_point_of_line_col(
+                            .line_point_of_display_line_col(
                                 ctx.text(),
                                 line,
                                 left_col,
@@ -1443,7 +1499,7 @@ impl LapceEditor {
                             .x;
                         let mut x1 = data
                             .doc
-                            .line_point_of_line_col(
+                            .line_point_of_display_line_col(
                                 ctx.text(),
                                 line,
                                 right_col,
@@ -1501,8 +1557,15 @@ impl LapceEditor {
         }
         let start_line = *screen_lines.lines.first().unwrap();
         let end_line = *screen_lines.lines.last().unwrap();
-        let start = data.doc.buffer().offset_of_line(start_line);
-        let end = data.doc.buffer().offset_of_line(end_line + 1);
+        // let start = data.doc.buffer().offset_of_line(start_line);
+        // let end = data.doc.buffer().offset_of_line(end_line + 1);
+        let start = data.doc.display_line_nearest_offset(start_line);
+        // TODO: Should we be constructing a display line like this?
+        let end = data
+            .doc
+            .display_line_nearest_offset(DisplayLine::new_unchecked(
+                end_line.get() + 1,
+            ));
 
         let cursor_offset = data.editor.cursor.offset();
 
@@ -1520,9 +1583,12 @@ impl LapceEditor {
                 let start = region.min();
                 let end = region.max();
                 let active = start <= cursor_offset && cursor_offset <= end;
+                // let (start_line, start_col) =
+                //     data.doc.buffer().offset_to_line_col(start);
+                // let (end_line, end_col) = data.doc.buffer().offset_to_line_col(end);
                 let (start_line, start_col) =
-                    data.doc.buffer().offset_to_line_col(start);
-                let (end_line, end_col) = data.doc.buffer().offset_to_line_col(end);
+                    data.doc.offset_to_display_line_col(start);
+                let (end_line, end_col) = data.doc.offset_to_display_line_col(end);
                 for line in &screen_lines.lines {
                     let line = *line;
                     if line < start_line {
@@ -1538,11 +1604,14 @@ impl LapceEditor {
                     let right_col = if line == end_line {
                         end_col
                     } else {
-                        data.doc.buffer().line_end_col(line, true) + 1
+                        // TODO: DOn't unwrap
+                        data.doc.display_line_end_col(line, true).unwrap() + 1
                     };
 
+                    // TODO: Don't unwrap
+                    let line_info = data.doc.display_line_info(line).unwrap();
                     let phantom_text =
-                        data.doc.line_phantom_text(&data.config, line);
+                        data.doc.line_phantom_text(&data.config, line_info);
                     let left_col = phantom_text.col_at(left_col);
                     let right_col = phantom_text.col_at(right_col);
 
@@ -1607,15 +1676,20 @@ impl LapceEditor {
         let rect = ctx.region().bounding_box();
         let x0 = rect.x0;
         let y0 = rect.y0;
+
         let start_line = (rect.y0 / line_height).floor() as usize;
-        let y_diff = y0 - start_line as f64 * line_height;
+        let start_line = DisplayLine::new_unchecked(start_line);
+
+        let y_diff = y0 - start_line.get() as f64 * line_height;
         let mut last_sticky_should_scroll = false;
 
         let mut sticky_lines = Vec::new();
         if let Some(lines) = data.doc.sticky_headers(start_line) {
             let total_lines = lines.len();
             if total_lines > 0 {
-                let line = start_line + total_lines;
+                let line =
+                    DisplayLine::new_unchecked(start_line.get() + total_lines);
+                // let line = start_line + total_lines;
                 if let Some(new_lines) = data.doc.sticky_headers(line) {
                     if new_lines.len() > total_lines {
                         sticky_lines = new_lines;
@@ -1623,8 +1697,11 @@ impl LapceEditor {
                         sticky_lines = lines;
                         last_sticky_should_scroll = new_lines.len() < total_lines;
                         if new_lines.len() < total_lines {
+                            let end_line = DisplayLine::new_unchecked(
+                                start_line.get() + total_lines - 1,
+                            );
                             if let Some(new_new_lines) =
-                                data.doc.sticky_headers(start_line + total_lines - 1)
+                                data.doc.sticky_headers(end_line)
                             {
                                 if new_new_lines.len() < total_lines {
                                     sticky_lines.pop();
@@ -1645,11 +1722,12 @@ impl LapceEditor {
 
         let total_sticky_lines = sticky_lines.len();
 
+        let end_line =
+            DisplayLine::new_unchecked(start_line.get() + total_sticky_lines - 1);
         let paint_last_line = total_sticky_lines > 0
             && (last_sticky_should_scroll
                 || y_diff != 0.0
-                || start_line + total_sticky_lines - 1
-                    != *sticky_lines.last().unwrap());
+                || end_line != *sticky_lines.last().unwrap());
 
         // Fix up the line count in case we don't need to paint the last one.
         let total_sticky_lines = if paint_last_line {
@@ -1722,11 +1800,14 @@ impl LapceEditor {
     ) {
         if let Some(snippet) = data.editor.snippet.as_ref() {
             for (_, (start, end)) in snippet {
+                // let (start_line, start_col) =
+                //     data.doc.buffer().offset_to_line_col(*start.min(end));
+                // let (end_line, end_col) =
+                //     data.doc.buffer().offset_to_line_col(*start.max(end));
                 let (start_line, start_col) =
-                    data.doc.buffer().offset_to_line_col(*start.min(end));
+                    data.doc.offset_to_display_line_col(*start.min(end));
                 let (end_line, end_col) =
-                    data.doc.buffer().offset_to_line_col(*start.max(end));
-
+                    data.doc.offset_to_display_line_col(*start.max(end));
                 for line in &screen_lines.lines {
                     let line = *line;
                     if line < start_line {
@@ -1742,22 +1823,23 @@ impl LapceEditor {
                         _ if line == start_line => start_col,
                         _ => 0,
                     };
+                    // TODO: don't unwrap
+                    let max_col = data.doc.display_line_end_col(line, true).unwrap();
                     let right_col = match line {
-                        _ if line == end_line => {
-                            let max_col = data.doc.buffer().line_end_col(line, true);
-                            end_col.min(max_col)
-                        }
-                        _ => data.doc.buffer().line_end_col(line, true),
+                        _ if line == end_line => end_col.min(max_col),
+                        _ => max_col,
                     };
 
+                    // TODO: don't unwrap
+                    let line_info = data.doc.display_line_info(line).unwrap();
                     let phantom_text =
-                        data.doc.line_phantom_text(&data.config, line);
+                        data.doc.line_phantom_text(&data.config, line_info);
                     let left_col = phantom_text.col_at(left_col);
                     let right_col = phantom_text.col_at(right_col);
 
                     let x0 = data
                         .doc
-                        .line_point_of_line_col(
+                        .line_point_of_display_line_col(
                             ctx.text(),
                             line,
                             left_col,
@@ -1767,7 +1849,7 @@ impl LapceEditor {
                         .x;
                     let x1 = data
                         .doc
-                        .line_point_of_line_col(
+                        .line_point_of_display_line_col(
                             ctx.text(),
                             line,
                             right_col,
@@ -1808,19 +1890,25 @@ impl LapceEditor {
                 if start_offset == cursor_offset {
                     current = Some(diagnostic.clone());
                 }
+                // TODO: This should be using offsets so that we can position them on wrapped lines properly
                 for line in &screen_lines.lines {
                     let line = *line;
-                    if line < start.line as usize {
+                    // TODO: is nearest really what we want?
+                    let (real_line, _) =
+                        data.doc.display_line_nearest_line_col(line, 0);
+                    if real_line < start.line as usize {
                         continue;
                     }
-                    if line > end.line as usize {
+                    if real_line > end.line as usize {
                         break;
                     }
 
                     let info = screen_lines.info.get(&line).unwrap();
 
+                    // TODO: don't unwrap
+                    let line_info = data.doc.display_line_info(line).unwrap();
                     let phantom_text =
-                        data.doc.line_phantom_text(&data.config, line);
+                        data.doc.line_phantom_text(&data.config, line_info);
 
                     let text_layout = data.doc.get_text_layout(
                         ctx.text(),
@@ -1828,23 +1916,30 @@ impl LapceEditor {
                         info.font_size,
                         &data.config,
                     );
-                    let x0 = if line == start.line as usize {
+                    let x0 = if real_line == start.line as usize {
                         let col = phantom_text.col_at(start.character as usize);
                         text_layout.text.hit_test_text_position(col).point.x
                     } else {
-                        let (_, col) = data.doc.buffer().offset_to_line_col(
-                            data.doc
-                                .buffer()
-                                .first_non_blank_character_on_line(line),
-                        );
+                        // TODO: don't unwrap
+                        // TODO: do we need the phantom text col at?
+                        let col = data
+                            .doc
+                            .first_non_blank_character_on_display_line(line)
+                            .unwrap();
+                        // let (_, col) = data.doc.buffer().offset_to_line_col(
+                        //     data.doc
+                        //         .buffer()
+                        //         .first_non_blank_character_on_line(line),
+                        // );
                         let col = phantom_text.col_at(col);
                         text_layout.text.hit_test_text_position(col).point.x
                     };
-                    let x1 = if line == end.line as usize {
+                    let x1 = if real_line == end.line as usize {
                         let col = phantom_text.col_at(end.character as usize);
                         text_layout.text.hit_test_text_position(col).point.x
                     } else {
-                        let col = data.doc.buffer().line_end_col(line, false) + 1;
+                        let col =
+                            data.doc.buffer().line_end_col(real_line, false) + 1;
                         let col = phantom_text.col_at(col);
                         text_layout.text.hit_test_text_position(col).point.x
                     };
@@ -1878,7 +1973,12 @@ impl LapceEditor {
 
         if let Some(diagnostic) = current {
             let start = diagnostic.diagnostic.range.start;
-            if let Some(info) = screen_lines.info.get(&(start.line as usize)) {
+            let (start_line, start_col) =
+                data.doc.buffer().position_to_line_col(&start);
+            // TODO: don't unwrap
+            let (start_line, start_col) =
+                data.doc.display_line_col(start_line, start_col).unwrap();
+            if let Some(info) = screen_lines.info.get(&start_line) {
                 if data.editor.cursor.is_normal() {
                     let text_layout = ctx
                         .text()
@@ -2003,8 +2103,15 @@ impl LapceEditor {
 
         let start_line = *screen_lines.lines.first().unwrap();
         let end_line = *screen_lines.lines.last().unwrap();
-        let start = data.doc.buffer().offset_of_line(start_line);
-        let end = data.doc.buffer().offset_of_line(end_line + 1);
+        // let start = data.doc.buffer().offset_of_line(start_line);
+        // let end = data.doc.buffer().offset_of_line(end_line + 1);
+        let start = data.doc.display_line_nearest_offset(start_line);
+        // TODO: Should we be constructing a display line like this?
+        let end = data
+            .doc
+            .display_line_nearest_offset(DisplayLine::new_unchecked(
+                end_line.get() + 1,
+            ));
 
         if let Some((start_offset, end_offset)) =
             data.doc.find_enclosing_brackets(cursor_offset)
@@ -2048,20 +2155,23 @@ impl LapceEditor {
         screen_lines: &ScreenLines,
         offset: usize,
     ) {
-        let (line, col) = data.doc.buffer().offset_to_line_col(offset);
+        let (line, col) = data.doc.offset_to_display_line_col(offset);
+        // let (line, col) = data.doc.buffer().offset_to_line_col(offset);
         let info = match screen_lines.info.get(&line) {
             Some(info) => info,
             None => return,
         };
         let char_width = data.config.editor_char_width(ctx.text());
 
-        let phantom_text = data.doc.line_phantom_text(&data.config, line);
+        // TODO: don't unwrap
+        let line_info = data.doc.display_line_info(line).unwrap();
+        let phantom_text = data.doc.line_phantom_text(&data.config, line_info);
 
         let col = phantom_text.col_after(col, true);
 
         let x0 = data
             .doc
-            .line_point_of_line_col(
+            .line_point_of_display_line_col(
                 ctx.text(),
                 line,
                 col,
@@ -2071,12 +2181,14 @@ impl LapceEditor {
             .x;
 
         let right_offset = offset + 1;
-        let (_, right_col) = data.doc.buffer().offset_to_line_col(right_offset);
+        // TODO: This is probably incorrect! Are we using phantom text properly here??
+        let (_, right_col) = data.doc.offset_to_display_line_col(right_offset);
+        // let (_, right_col) = data.doc.buffer().offset_to_line_col(right_offset);
         let right_col = phantom_text.col_after(right_col, false);
 
         let x1 = data
             .doc
-            .line_point_of_line_col(
+            .line_point_of_display_line_col(
                 ctx.text(),
                 line,
                 right_col,
@@ -2113,9 +2225,12 @@ impl LapceEditor {
 
         const LINE_WIDTH: f64 = 1.0;
 
+        // let (start_line, start_col) =
+        //     data.doc.buffer().offset_to_line_col(start_offset);
+        // let (end_line, end_col) = data.doc.buffer().offset_to_line_col(end_offset);
         let (start_line, start_col) =
-            data.doc.buffer().offset_to_line_col(start_offset);
-        let (end_line, end_col) = data.doc.buffer().offset_to_line_col(end_offset);
+            data.doc.offset_to_display_line_col(start_offset);
+        let (end_line, end_col) = data.doc.offset_to_display_line_col(end_offset);
 
         let first_screen_line = *screen_lines.lines.first().unwrap();
 
@@ -2160,8 +2275,10 @@ impl LapceEditor {
                 LINE_WIDTH,
             );
         } else {
-            let last_line = data.doc.buffer().last_line();
-            for line in start_line..end_line + 1 {
+            // let last_line = data.doc.buffer().last_line();
+            let last_line = data.doc.display_line_last();
+            for line in start_line.get()..end_line.get() + 1 {
+                let line = DisplayLine::new_unchecked(line);
                 if line > last_line {
                     break;
                 }
@@ -2191,14 +2308,14 @@ impl LapceEditor {
                 )
             };
 
-            let lines = end_line - first_line;
+            let lines = end_line.get() - first_line.get();
 
-            let y1 = if data
+            // TODO: don't unwrap
+            let end_line_first_col = data
                 .doc
-                .buffer()
-                .first_non_blank_character_on_line(end_line)
-                < end_offset
-            {
+                .first_non_blank_character_on_display_line(end_line)
+                .unwrap();
+            let y1 = if end_line_first_col < end_offset {
                 paint_horizontal_line_at_end = true;
                 info.y + ((lines + 1) as f64 * info.line_height)
             } else {
@@ -2282,16 +2399,18 @@ impl LapceEditor {
     fn calculate_x_coordinate(
         ctx: &mut PaintCtx,
         data: &LapceEditorBufferData,
-        line: usize,
+        line: DisplayLine,
         column: usize,
         font_size: usize,
     ) -> f64 {
-        let phantom_text = data.doc.line_phantom_text(&data.config, line);
+        // TODO: Don't unwrap
+        let line_info = data.doc.display_line_info(line).unwrap();
+        let phantom_text = data.doc.line_phantom_text(&data.config, line_info);
 
         let column = phantom_text.col_after(column, true);
 
         data.doc
-            .line_point_of_line_col(
+            .line_point_of_display_line_col(
                 ctx.text(),
                 line,
                 column,
@@ -2356,7 +2475,7 @@ impl Widget<LapceTabData> for LapceEditor {
                         data.main_split.editors.get(&self.view_id).unwrap().clone();
                     let mut editor_data = data.editor_view_content(self.view_id);
                     let doc = editor_data.doc.clone();
-                    let (offset, _) = doc.offset_of_point(
+                    let (offset, _) = doc.nearest_offset_of_point(
                         ctx.text(),
                         editor.cursor.get_mode(),
                         self.mouse_pos,
@@ -2416,18 +2535,26 @@ impl Widget<LapceTabData> for LapceEditor {
                                     let offset = editor_data.editor.cursor.offset();
                                     let (line, col) = editor_data
                                         .doc
-                                        .buffer()
-                                        .offset_to_line_col(offset);
+                                        .offset_to_display_line_col(offset);
+                                    // let (line, col) = editor_data
+                                    //     .doc
+                                    //     .buffer()
+                                    //     .offset_to_line_col(offset);
 
+                                    // TODO: don't unwrap
+                                    let line_info = editor_data
+                                        .doc
+                                        .display_line_info(line)
+                                        .unwrap();
                                     let phantom_text = editor_data
                                         .doc
-                                        .line_phantom_text(&data.config, line);
+                                        .line_phantom_text(&data.config, line_info);
 
                                     let col = phantom_text.col_at(col);
 
                                     let x = editor_data
                                         .doc
-                                        .line_point_of_line_col(
+                                        .line_point_of_display_line_col(
                                             ctx.text(),
                                             line,
                                             col,
@@ -2437,7 +2564,7 @@ impl Widget<LapceTabData> for LapceEditor {
                                         .x;
                                     let y = editor_data.config.editor.line_height()
                                         as f64
-                                        * (line + 1) as f64;
+                                        * (line.get() + 1) as f64;
                                     ctx.to_window(Point::new(x, y))
                                 });
                                 ctx.show_context_menu::<LapceData>(menu, point);
