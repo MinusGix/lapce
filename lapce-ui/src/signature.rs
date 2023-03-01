@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use druid::{
+    piet::{Text, TextLayoutBuilder},
     theme, ArcStr, BoxConstraints, Color, Command, Env, Event, EventCtx,
     FontDescriptor, FontWeight, LayoutCtx, LifeCycle, PaintCtx, Point,
     RenderContext, Size, Target, TextLayout, UpdateCtx, Widget, WidgetId, WidgetPod,

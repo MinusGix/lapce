@@ -517,11 +517,8 @@ impl LapceEditorView {
                     Some(next_normal_line) => {
                         let next_normal_line = *next_normal_line;
                         // TODO: this is incorrect. Should maybe be using an interval of the display lines that we'd get??
-                        let next_normal_line = data
-                            .doc
-                            .display_line_col(next_normal_line, 0)
-                            .unwrap()
-                            .0;
+                        let next_normal_line =
+                            data.doc.display_line_col(next_normal_line, 0).0;
                         if next_normal_line < line {
                             let chunk_height = data.config.editor.code_lens_font_size
                                 as f64

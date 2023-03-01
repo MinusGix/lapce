@@ -1015,9 +1015,9 @@ impl LapceEditor {
             let line = *line;
             // let last_line = data.doc.buffer().last_line();
             // TODO: is this correct?
-            let last_line = data.doc.constrain_display_line(line);
+            let limited_line = data.doc.constrain_display_line(line);
             // If it changed to a different line after constraining it, then we're done
-            if line != last_line {
+            if line != limited_line {
                 break;
             }
             // if line > last_line {
@@ -1091,6 +1091,7 @@ impl LapceEditor {
                 }
             }
 
+            // println!("Draw text: {} at ({}, {})", line.get(), info.x, y);
             ctx.draw_text(&text_layout.text, Point::new(info.x, y));
         }
     }
@@ -1107,7 +1108,7 @@ impl LapceEditor {
         char_width: f64,
         block: bool,
     ) {
-        let (line, col) = data.doc.buffer().offset_to_line_col(offset);
+        let (line, col) = data.doc.offset_to_display_line_col(offset);
         let line_info = data.doc.offset_to_display_line_info(offset).unwrap();
         let phantom_text = data.doc.line_phantom_text(&data.config, line_info);
 
@@ -1118,31 +1119,39 @@ impl LapceEditor {
             phantom_text.col_after(col, false)
         };
 
-        let col = data
-            .doc
-            .ime_text()
-            .map(|_| {
-                let (ime_line, _, shift) = data.doc.ime_pos();
-                if ime_line == line {
-                    col + shift
-                } else {
-                    col
-                }
-            })
-            .unwrap_or(col);
+        // TODO: This probably needs to consider the display line the cursor is on!
+        // let col = data
+        //     .doc
+        //     .ime_text()
+        //     .map(|_| {
+        //         let (ime_line, _, shift) = data.doc.ime_pos();
+        //         if ime_line == line {
+        //             col + shift
+        //         } else {
+        //             col
+        //         }
+        //     })
+        //     .unwrap_or(col);
 
         // TODO: this should probably be using the y parameter?
         let x0 = data
             .doc
-            .line_point_of_line_col(ctx.text(), line, col, font_size, &data.config)
+            .line_point_of_display_line_col(
+                ctx.text(),
+                line,
+                col,
+                font_size,
+                &data.config,
+            )
             .x;
         if block {
             let right_offset = data.doc.buffer().move_right(offset, Mode::Insert, 1);
-            let (_, right_col) = data.doc.buffer().offset_to_line_col(right_offset);
+            let (_, right_col) = data.doc.offset_to_display_line_col(right_offset);
+            // let (_, right_col) = data.doc.buffer().offset_to_line_col(right_offset);
             let right_col = phantom_text.col_after(right_col, false);
             let x1 = data
                 .doc
-                .line_point_of_line_col(
+                .line_point_of_display_line_col(
                     ctx.text(),
                     line,
                     right_col,
@@ -1160,7 +1169,7 @@ impl LapceEditor {
         } else {
             let x0 = data
                 .doc
-                .line_point_of_line_col(
+                .line_point_of_display_line_col(
                     ctx.text(),
                     line,
                     col,
@@ -1191,7 +1200,7 @@ impl LapceEditor {
         match &data.editor.cursor.mode {
             CursorMode::Normal(offset) => {
                 // let (cursor_line, _) = data.doc.buffer().offset_to_line_col(*offset);
-                let cursor_line = data.doc.offset_to_display_line(*offset).unwrap();
+                let cursor_line = data.doc.offset_to_display_line(*offset);
                 if let Some(info) = screen_lines.info.get(&cursor_line) {
                     ctx.fill(
                         Rect::ZERO
@@ -1221,8 +1230,7 @@ impl LapceEditor {
                     let cursor_offset = region.end;
                     // let (cursor_line, _) =
                     //     data.doc.buffer().offset_to_line_col(cursor_offset);
-                    let cursor_line =
-                        data.doc.offset_to_display_line(cursor_offset).unwrap();
+                    let cursor_line = data.doc.offset_to_display_line(cursor_offset);
                     if let Some(info) = screen_lines.info.get(&cursor_line) {
                         ctx.fill(
                             Rect::ZERO
@@ -1255,8 +1263,7 @@ impl LapceEditor {
                 if is_focused {
                     // let (cursor_line, _) =
                     //     data.doc.buffer().offset_to_line_col(*offset);
-                    let cursor_line =
-                        data.doc.offset_to_display_line(*offset).unwrap();
+                    let cursor_line = data.doc.offset_to_display_line(*offset);
                     if let Some(info) = screen_lines.info.get(&cursor_line) {
                         Self::paint_cursor_caret(
                             ctx,
@@ -1286,7 +1293,7 @@ impl LapceEditor {
                 let (end_line, end_col) =
                     data.doc.offset_to_display_line_col(*start.max(end));
                 // TODO: DOn't unwrap
-                let cursor_line = data.doc.offset_to_display_line(*end).unwrap();
+                let cursor_line = data.doc.offset_to_display_line(*end);
                 for line in &screen_lines.lines {
                     let line = *line;
                     if line < start_line {
@@ -1722,8 +1729,8 @@ impl LapceEditor {
 
         let total_sticky_lines = sticky_lines.len();
 
-        let end_line =
-            DisplayLine::new_unchecked(start_line.get() + total_sticky_lines - 1);
+        let end_line = (start_line.get() + total_sticky_lines).saturating_sub(1);
+        let end_line = DisplayLine::new_unchecked(end_line);
         let paint_last_line = total_sticky_lines > 0
             && (last_sticky_should_scroll
                 || y_diff != 0.0
@@ -1975,9 +1982,8 @@ impl LapceEditor {
             let start = diagnostic.diagnostic.range.start;
             let (start_line, start_col) =
                 data.doc.buffer().position_to_line_col(&start);
-            // TODO: don't unwrap
             let (start_line, start_col) =
-                data.doc.display_line_col(start_line, start_col).unwrap();
+                data.doc.display_line_col(start_line, start_col);
             if let Some(info) = screen_lines.info.get(&start_line) {
                 if data.editor.cursor.is_normal() {
                     let text_layout = ctx

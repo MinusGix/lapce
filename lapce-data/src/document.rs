@@ -39,6 +39,7 @@ use lapce_rpc::{
     style::{LineStyle, LineStyles, Style},
 };
 use lapce_xi_rope::{
+    breaks::{BreakBuilder, Breaks, BreaksMetric},
     spans::{Spans, SpansBuilder},
     Interval, Rope, RopeDelta, Transformer,
 };
@@ -442,6 +443,8 @@ pub struct Document {
     line_styles: Rc<RefCell<LineStyles>>,
     /// Semantic highlighting information (which is provided by the LSP)
     semantic_styles: Option<Arc<Spans<Style>>>,
+    /// Line break information for the content
+    breaks: Breaks,
     /// The ready-to-render text layouts for the document.  
     /// This is an `Rc<RefCell<_>>` due to needing to access it even when the document is borrowed,
     /// since we may need to fill it with constructed text layouts.
@@ -514,6 +517,7 @@ impl Document {
             content,
             syntax,
             line_styles: Rc::new(RefCell::new(HashMap::new())),
+            breaks: Breaks::new_no_break(0),
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             sticky_headers: Rc::new(RefCell::new(HashMap::new())),
             semantic_styles: None,
@@ -1047,6 +1051,7 @@ impl Document {
         self.get_semantic_styles();
         self.clear_sticky_headers_cache();
         self.trigger_head_change();
+        self.compute_line_breaks();
         self.notify_special();
     }
 
@@ -1186,6 +1191,35 @@ impl Document {
         }
     }
 
+    fn compute_line_breaks(&mut self) {
+        // TODO: this should depend on the buffercontent kind?
+
+        let lines = self.buffer.text().lines(..);
+        let mut breaks = BreakBuilder::new();
+        let line_char_limit = 60;
+
+        // TODO: this could do a more iterative approach to definitely avoid allocating any strings?
+        for line in lines {
+            // TODO: this will break in the middle of a utf8 char!!!
+            let break_count = line.len() / line_char_limit;
+            println!("Break count for line: {} is {}", line, break_count);
+
+            for _ in 0..break_count {
+                breaks.add_break(line_char_limit);
+            }
+
+            // TODO: is this correct for the last line?
+            // Then add the remainder
+            let rem = line.len() % line_char_limit;
+            if rem == 0 {}
+            // TODO: is this correct?
+            // Add a no break for the remaining characters since it is at a newline
+            breaks.add_no_break(rem);
+        }
+
+        self.breaks = breaks.build();
+    }
+
     /// Update the inlay hints so their positions are correct after an edit.
     fn update_inlay_hints(&mut self, delta: &RopeDelta) {
         if let Some(hints) = self.inlay_hints.as_mut() {
@@ -1220,18 +1254,153 @@ impl Document {
     /// Get information about the display line. Like what line it is in the buffer and break index
     /// it is at, or if it is a purely phantom line.
     pub fn display_line_info(&self, line: DisplayLine) -> Option<DisplayLineInfo> {
-        // TODO: actual impl
-        Some(DisplayLineInfo::Buffer {
-            line: line.get(),
-            break_idx: 0,
-        })
+        let line = line.get();
+
+        if line == 0 {
+            return Some(DisplayLineInfo::Buffer {
+                line: 0,
+                break_idx: 0,
+            });
+        }
+
+        println!("display_line_info: {}", line);
+
+        let mut cur_line = 0;
+        let rope = self.buffer.text();
+        // TODO: We don't actually need the text, just the line index. We should use a different function that won't ever need to allocate them
+        for (real_line, _) in rope.lines(..).enumerate() {
+            // TODO: this doesn't consider phantom lines!
+            println!("\treal_line: {}", real_line);
+
+            // let line_offset = self.buffer.offset_of_line(real_line);
+
+            // If the line is the last line, we need to count the breaks up to the end of the buffer
+            // let line_breaks = if real_line == self.buffer.last_line() {
+            //     // Count the number of breaks up to this last line and then subtract the number of breaks before the last line
+            //     let line_breaks_up_to =
+            //         self.breaks.count::<BreaksMetric>(line_offset);
+            //     let line_breaks_prev =
+            //         self.breaks.count::<BreaksMetric>(line_offset - 1);
+
+            //     line_breaks_up_to - line_breaks_prev
+            // } else {
+            //     let next_line = real_line + 1;
+            //     let next_line_offset = self.buffer.offset_of_line(next_line);
+            //     // Count the number of breaks up to this line
+            //     let line_breaks_up_to =
+            //         self.breaks.count::<BreaksMetric>(line_offset);
+            //     let line_breaks_next =
+            //         self.breaks.count::<BreaksMetric>(next_line_offset);
+
+            //     println!("\t\tline_breaks_up_to: {}", line_breaks_up_to);
+            //     println!("\t\tline_breaks_next: {}", line_breaks_next);
+
+            //     line_breaks_next - line_breaks_up_to
+            // };
+            // let next_line = real_line + 1;
+            // let next_line_offset = self.buffer.offset_of_line(next_line);
+
+            // // Count the number of breaks up to this line
+            // let line_breaks_up_to = self.breaks.count::<BreaksMetric>(line_offset);
+            // let line_breaks_next =
+            //     self.breaks.count::<BreaksMetric>(next_line_offset);
+
+            // // TODO: we should probably be able to calculate this more efficiently?
+            // // The line breaks that this line has
+            // let line_breaks = line_breaks_next - line_breaks_up_to;
+
+            let line_offset = self.buffer.offset_of_line(real_line);
+            let line_breaks_from_start =
+                self.breaks.count::<BreaksMetric>(line_offset);
+            let line_end_offset = self.buffer.line_end_offset(real_line, true);
+            let line_breaks_to_end =
+                self.breaks.count::<BreaksMetric>(line_end_offset);
+            let line_breaks = line_breaks_to_end - line_breaks_from_start;
+
+            println!("\t\tline_breaks: {}", line_breaks);
+
+            // Check if the cur_line with the line breaks is the line we are looking for
+            // It could be that jumping forward by line breaks would end up *past* the line we're
+            // looking for. So we need to check the range of lines.
+            if cur_line + line_breaks >= line {
+                // Check if we go past the line's actual line breaks
+
+                //     println!("\t\tFound the line but we seemed to be going over??");
+                //     return None;
+                // }
+
+                // We found the line
+                println!(
+                    "\t\tFound the line: {} with break: {} - {} = {}",
+                    real_line,
+                    line,
+                    cur_line,
+                    line - cur_line
+                );
+                return Some(DisplayLineInfo::Buffer {
+                    line: real_line,
+                    break_idx: line - cur_line,
+                });
+            }
+
+            // We didn't find the line, so we need to jump forward by the line breaks
+            cur_line += line_breaks + 1;
+            println!("\t\tcur_line: {}", cur_line);
+        }
+
+        println!("Failed to find the line: {line}");
+        None
+
+        // // TODO: actual impl
+        // Some(DisplayLineInfo::Buffer {
+        //     line: line,
+        //     break_idx: 0,
+        // })
     }
 
     pub fn display_line_info_to_line(&self, info: DisplayLineInfo) -> DisplayLine {
         // TODO
         match info {
             DisplayLineInfo::Buffer { line, break_idx } => {
-                DisplayLine::new_unchecked(line)
+                if line == 0 && break_idx == 0 {
+                    return DisplayLine::new_unchecked(0);
+                }
+
+                // Current display line
+                let mut cur_line = 0;
+
+                let mut last_real_line = 0;
+                let rope = self.buffer.text();
+                // TODO: We don't actually need the text, just the line index. We should use a different function that won't ever need to allocate them
+                for (real_line, _) in rope.lines(..).enumerate() {
+                    // TODO: this doesn't consider phantom lines!
+
+                    let line_offset = self.buffer.offset_of_line(real_line);
+                    let line_breaks_from_start =
+                        self.breaks.count::<BreaksMetric>(line_offset);
+                    let line_end_offset =
+                        self.buffer.line_end_offset(real_line, true);
+                    let line_breaks_to_end =
+                        self.breaks.count::<BreaksMetric>(line_end_offset);
+                    let line_breaks = line_breaks_to_end - line_breaks_from_start;
+
+                    if real_line == line {
+                        // We found the line
+                        return DisplayLine::new_unchecked(cur_line + break_idx);
+                    }
+
+                    // We didn't find the line, so we need to jump forward by the line breaks
+                    cur_line += line_breaks + 1;
+                    last_real_line = real_line;
+                }
+
+                println!(
+                    "Failed to find the line: {line} {break_idx} {last_real_line}"
+                );
+
+                // We didn't find the display line??? Out of bounds line.
+                // panic!()
+                DisplayLine::new_unchecked(cur_line + break_idx)
             }
             DisplayLineInfo::Phantom { line, .. } => line,
         }
@@ -1250,30 +1419,28 @@ impl Document {
             }
             // No need to modify it
             Some(DisplayLineInfo::Phantom { .. }) => line,
-            None => self.display_line_info_to_line(DisplayLineInfo::Buffer {
-                line: self.buffer.last_line(),
-                // TODO: clicking after the end of the document should go to the *last* breakage,
-                // since that's the actual display last line
-                break_idx: 0,
-            }),
+            None => self.display_line_last(),
         }
     }
 
     /// The last display line
     pub fn display_line_last(&self) -> DisplayLine {
-        todo!()
+        self.display_line_info_to_line(DisplayLineInfo::Buffer {
+            // TODO: is this correct?
+            line: self.buffer.last_line().saturating_sub(1),
+            // TODO: clicking after the end of the document should go to the *last* breakage,
+            // since that's the actual display last line
+            break_idx: 0,
+        })
     }
 
     /// Get the [`DisplayLine`] for the given buffer line and column.  
     /// If possible, it returns the relevant [`DisplayLine`] instance and the new column offset.  
     /// (Ex: the column can change if the line wraps)
-    pub fn display_line_col(
-        &self,
-        line: usize,
-        col: usize,
-    ) -> Option<(DisplayLine, usize)> {
-        // TODO
-        Some((DisplayLine::new_unchecked(line), col))
+    pub fn display_line_col(&self, line: usize, col: usize) -> (DisplayLine, usize) {
+        println!("display_line_col");
+        let offset = self.buffer.offset_of_line_col(line, col);
+        self.offset_to_display_line_col(offset)
     }
 
     /// Convert the display line and column (such as gotten from [`Document::line_col_of_point`]))
@@ -1283,14 +1450,69 @@ impl Document {
         line: DisplayLine,
         col: usize,
     ) -> (usize, usize) {
-        // TODO
-        (line.get(), col)
+        let line = line.get();
+
+        // TODO: deduplicate? This could just use displayl ine info or something, or they could all use some central func
+        let mut cur_line = 0;
+        let rope = self.buffer.text();
+        // TODO: We don't actually need the text, just the line index. We should use a different function that won't ever need to allocate them
+        for (real_line, _) in rope.lines(..).enumerate() {
+            // TODO: this doesn't consider phantom lines!
+
+            let line_offset = self.buffer.offset_of_line(real_line);
+            let line_breaks_from_start =
+                self.breaks.count::<BreaksMetric>(line_offset);
+            let line_end_offset = self.buffer.line_end_offset(real_line, true);
+            let line_breaks_to_end =
+                self.breaks.count::<BreaksMetric>(line_end_offset);
+            let line_breaks = line_breaks_to_end - line_breaks_from_start;
+
+            // The column is in the display line *after* the wrapping
+            if cur_line + line_breaks >= line {
+                // We found the line
+                let break_idx = line - cur_line;
+                // FIXME: Don't hardcode 60
+                let break_col = break_idx * 60;
+                let col = col + break_col;
+                return (real_line, col);
+            }
+
+            // We didn't find the line, so we need to jump forward by the line breaks
+            cur_line += line_breaks + 1;
+        }
+
+        // TODO: is this good?
+        (self.buffer.last_line(), 0)
     }
 
-    // TODO: this function seems kinda weird
     pub fn display_line_nearest_offset(&self, line: DisplayLine) -> usize {
-        // TODO
-        self.buffer.offset_of_line(line.get())
+        let line = line.get();
+
+        // TODO: deduplicate? This could just use displayl ine info or something, or they could all use some central func
+        let mut cur_line = 0;
+        let rope = self.buffer.text();
+        // TODO: We don't actually need the text, just the line index. We should use a different function that won't ever need to allocate them
+        for (real_line, _) in rope.lines(..).enumerate() {
+            // TODO: this doesn't consider phantom lines!
+
+            let line_offset = self.buffer.offset_of_line(real_line);
+            let line_breaks_from_start =
+                self.breaks.count::<BreaksMetric>(line_offset);
+            let line_end_offset = self.buffer.line_end_offset(real_line, true);
+            let line_breaks_to_end =
+                self.breaks.count::<BreaksMetric>(line_end_offset);
+            let line_breaks = line_breaks_to_end - line_breaks_from_start;
+
+            if cur_line + line_breaks >= line {
+                let line_offset = self.buffer.offset_of_line(real_line);
+                return line_offset;
+            }
+
+            // We didn't find the line, so we need to jump forward by the line breaks
+            cur_line += line_breaks + 1;
+        }
+
+        self.buffer.len()
     }
 
     /// Get the column of the end of this display line
@@ -1300,7 +1522,25 @@ impl Document {
         caret: bool,
     ) -> Option<usize> {
         // TODO
-        Some(self.buffer.line_end_col(line.get(), caret))
+        // Some(self.buffer.line_end_col(line.get(), caret))
+        let info = self.display_line_info(line)?;
+        match info {
+            DisplayLineInfo::Buffer { line, break_idx } => {
+                // // We can't just use buffer line_end_col because we want to only do it for the
+                // // potentially wrapped line part
+                // let line_content = self.buffer.line_content(line);
+                // TODO: don't hardcode 60
+                let break_col = break_idx * 60;
+                // let col = line_content.len() - break_col;
+                // TODO: test this
+                let line_end = self.buffer.line_end_col(line, caret);
+                Some(line_end - break_col)
+            }
+            DisplayLineInfo::Phantom {
+                line,
+                nearest_real_line,
+            } => todo!(),
+        }
     }
 
     pub fn offset_to_display_line_info(
@@ -1308,18 +1548,47 @@ impl Document {
         offset: usize,
     ) -> Option<DisplayLineInfo> {
         let line = self.offset_to_display_line(offset);
-        line.and_then(|line| self.display_line_info(line))
+        self.display_line_info(line)
     }
 
-    pub fn offset_to_display_line(&self, offset: usize) -> Option<DisplayLine> {
-        // TODO
-        Some(self.offset_to_display_line_col(offset).0)
+    pub fn offset_to_display_line(&self, offset: usize) -> DisplayLine {
+        self.offset_to_display_line_col(offset).0
     }
 
     pub fn offset_to_display_line_col(&self, offset: usize) -> (DisplayLine, usize) {
-        // TODO: this should be more complex than just the real line
+        println!("offset_to_display_line_col");
         let (line, col) = self.buffer.offset_to_line_col(offset);
-        (DisplayLine::new_unchecked(line), col)
+
+        // TODO: deduplicate? This could just use display line info or something, or they could all use some central func
+        let mut cur_line = 0;
+        let rope = self.buffer.text();
+        // TODO: We don't actually need the text, just the line index. We should use a different function that won't ever need to allocate them
+        for (real_line, _) in rope.lines(..).enumerate() {
+            // TODO: this doesn't consider phantom lines!
+
+            let line_offset = self.buffer.offset_of_line(real_line);
+            let line_breaks_from_start =
+                self.breaks.count::<BreaksMetric>(line_offset);
+            let line_end_offset = self.buffer.line_end_offset(real_line, true);
+            let line_breaks_to_end =
+                self.breaks.count::<BreaksMetric>(line_end_offset);
+            let line_breaks = line_breaks_to_end - line_breaks_from_start;
+
+            if real_line == line {
+                // TODO: don't hardcode 60
+                let break_count_to_col = col / 60;
+                let col = col % 60;
+                return (
+                    DisplayLine::new_unchecked(cur_line + break_count_to_col),
+                    col,
+                );
+            }
+
+            // We didn't find the line, so we need to jump forward by the line breaks
+            cur_line += line_breaks + 1;
+        }
+
+        (DisplayLine::new_unchecked(self.buffer.last_line()), 0)
     }
 
     /// Returns the column of the first nonblank character on the line.
@@ -2135,8 +2404,7 @@ impl Document {
         config: &LapceConfig,
     ) -> (Point, Point) {
         let (line, col) = self.buffer.offset_to_line_col(offset);
-        // TODO: don't unwrap
-        let (line, col) = self.display_line_col(line, col).unwrap();
+        let (line, col) = self.display_line_col(line, col);
         self.points_of_line_col(text, line, col, view, config)
     }
 
@@ -2328,10 +2596,7 @@ impl Document {
         font_size: usize,
         config: &LapceConfig,
     ) -> Point {
-        // TODO: is this the proper default value?
-        let (display_line, col) = self
-            .display_line_col(line, col)
-            .unwrap_or_else(|| (self.display_line_last(), 0));
+        let (display_line, col) = self.display_line_col(line, col);
         let text_layout =
             self.get_text_layout(text, display_line, font_size, config);
         text_layout.text.hit_test_text_position(col).point
@@ -2347,7 +2612,6 @@ impl Document {
         font_size: usize,
         config: &LapceConfig,
     ) -> Point {
-        // TODO: is this really what you want most of the time? Won't col be into the phantom text as well or something?
         let text_layout = self.get_text_layout(text, line, font_size, config);
         text_layout.text.hit_test_text_position(col).point
     }
@@ -2416,8 +2680,19 @@ impl Document {
     ) -> TextLayoutLine {
         let line_info = DisplayLineInfo::Buffer { line, break_idx };
 
-        // FIXME: use break_idx for wrapping
+        // TODO: this will break in the middle of a utf8 character!
         let line_content_original = self.buffer.line_content(line);
+        // TODO: configure this
+        let break_col = break_idx * 60;
+        let break_col_end = (break_idx * 60 + 60).min(line_content_original.len());
+        // println!(
+        //     "new_real_line_layout: line: {}, break_idx: {}, break_col: {}, break_col_end: {}",
+        //     line, break_idx, break_col, break_col_end
+        // );
+        // println!("\tLine content: {:?}", line_content_original);
+        // Get only the part of the line within the break
+        let line_content_original = &line_content_original[break_col..break_col_end];
+        // println!("\tLine content: {:?}", line_content_original);
 
         // Get the line content with newline characters replaced with spaces
         // and the content without the newline characters
@@ -2434,13 +2709,17 @@ impl Document {
                 )
             } else {
                 (
-                    line_content_original.to_string(),
+                    // TODO: this is wrong but i'm inserting it since the wrapped lines should maybe be told to include the space newline thing???
+                    // line_content_original.to_string(),
+                    format!("{line_content_original} "),
                     &line_content_original[..],
                 )
             };
+        // println!("\tLine content: {:?}", line_content);
         // Combine the phantom text with the line content
         let phantom_text = self.line_phantom_text(config, line_info);
         let line_content = phantom_text.combine_with_text(line_content);
+        // println!("\tLine content: {:?}", line_content);
 
         let tab_width =
             config.tab_width(text, config.editor.font_family(), font_size);
@@ -2468,11 +2747,25 @@ impl Document {
 
         // Apply various styles to the line's text based on our semantic/syntax highlighting
         let styles = self.line_style(line);
-        for line_style in styles.iter() {
+        // These filter out before phantom text shifting because we don't currently count phantom text for wrapping
+        // TODO: when/if we have a setting for this, then we should shift them
+        // We need to check if the range intersects break_col..break_col_end at all
+        let styles = styles
+            .iter()
+            .filter(|style| style.start >= break_col || style.end >= break_col);
+        for line_style in styles {
             if let Some(fg_color) = line_style.style.fg_color.as_ref() {
                 if let Some(fg_color) = config.get_style_color(fg_color) {
-                    let start = phantom_text.col_at(line_style.start);
-                    let end = phantom_text.col_at(line_style.end);
+                    // Get the intersection range
+                    // TODO: check for empty ranges?
+                    let start = line_style.start.max(break_col);
+                    let end = line_style.end.min(break_col_end);
+                    let start = start - break_col;
+                    let end = end - break_col;
+                    let start = phantom_text.col_at(start);
+                    let end = phantom_text.col_at(end);
+                    // let start = phantom_text.col_at(line_style.start);
+                    // let end = phantom_text.col_at(line_style.end);
                     layout_builder = layout_builder.range_attribute(
                         start..end,
                         TextAttribute::TextColor(fg_color.clone()),
@@ -2554,43 +2847,46 @@ impl Document {
             ));
         }
 
-        let new_whitespaces = Self::new_whitespace_layout(
-            line_content_original,
-            &text_layout,
-            &phantom_text,
-            config,
-        );
+        // let new_whitespaces = Self::new_whitespace_layout(
+        //     line_content_original,
+        //     &text_layout,
+        //     &phantom_text,
+        //     config,
+        // );
+        let new_whitespaces = None;
 
-        let indent_line = if line_content_original.trim().is_empty() {
-            let offset = self.buffer.offset_of_line(line);
-            if let Some(offset) = self
-                .syntax
-                .as_ref()
-                .and_then(|syntax| syntax.parent_offset(offset))
-            {
-                self.buffer.line_of_offset(offset)
-            } else {
-                line
-            }
-        } else {
-            line
-        };
+        // let indent_line = if line_content_original.trim().is_empty() {
+        //     let offset = self.buffer.offset_of_line(line);
+        //     if let Some(offset) = self
+        //         .syntax
+        //         .as_ref()
+        //         .and_then(|syntax| syntax.parent_offset(offset))
+        //     {
+        //         self.buffer.line_of_offset(offset)
+        //     } else {
+        //         line
+        //     }
+        // } else {
+        //     line
+        // };
 
-        let indent = if indent_line != line {
-            // TODO: this is incorrect probably
-            let indent_line =
-                self.display_line_info_to_line(DisplayLineInfo::Buffer {
-                    line: indent_line,
-                    break_idx: 0,
-                });
-            self.get_text_layout(text, indent_line, font_size, config)
-                .indent
-                + 1.0
-        } else {
-            let offset = self.buffer.first_non_blank_character_on_line(indent_line);
-            let (_, col) = self.buffer.offset_to_line_col(offset);
-            text_layout.hit_test_text_position(col).point.x
-        };
+        let indent = 0.0;
+        // let indent = if indent_line != line {
+        //     // TODO: this is incorrect probably
+        //     let indent_line =
+        //         self.display_line_info_to_line(DisplayLineInfo::Buffer {
+        //             line: indent_line,
+        //             break_idx: 0,
+        //         });
+        //     self.get_text_layout(text, indent_line, font_size, config)
+        //         .indent
+        //         + 1.0
+        // } else {
+        //     // TODO: should this use the breaked up line?
+        //     let offset = self.buffer.first_non_blank_character_on_line(indent_line);
+        //     let (_, col) = self.buffer.offset_to_line_col(offset);
+        //     text_layout.hit_test_text_position(col).point.x
+        // };
 
         TextLayoutLine {
             text: text_layout,
@@ -2612,6 +2908,10 @@ impl Document {
         let line_info = self.display_line_info(display_line);
         match line_info {
             Some(DisplayLineInfo::Buffer { line, break_idx }) => {
+                // println!(
+                //     "new_real_line_layout with {:?} / {:?}",
+                //     display_line, line_info
+                // );
                 self.new_real_line_layout(text, line, break_idx, font_size, config)
             }
             Some(DisplayLineInfo::Phantom {
@@ -3396,7 +3696,7 @@ impl Document {
                 .iter()
                 .filter_map(|offset| {
                     // TODO: is this correct?
-                    let l = self.offset_to_display_line(*offset)?;
+                    let l = self.offset_to_display_line(*offset);
                     // let l = self.buffer.line_of_offset(*offset);
                     if l <= line {
                         Some(l)
