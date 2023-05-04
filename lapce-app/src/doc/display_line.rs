@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use lapce_core::{buffer::Buffer, word::WordCursor};
 use smallvec::SmallVec;
@@ -50,30 +50,32 @@ impl DisplayLine {
             // two, then we need that for the `x + accum_line_count` below to ensure it includes
             // the first phantom text's phantom line.
             let mut accum_line_count = 0;
-            let p_iter = p_iter
-                .filter_map(|(_, _, _, text)| {
-                    let line_count = text.extra_line_count();
+            let p_iter = p_iter.filter_map(|(_, _, _, text)| {
+                let line_count = text.extra_line_count();
 
-                    if line_count == 0 {
-                        None
-                    } else {
-                        Some(line_count)
-                    }
-                })
-                .flat_map(move |line_count| {
-                    let res = (1..=line_count).map(move |x| {
-                        (
-                            DisplayLine::new_unchecked(cur_acc + x),
-                            x + accum_line_count,
-                            line,
-                        )
-                    });
-
-                    cur_acc += line_count;
-                    accum_line_count += line_count;
-
-                    res
+                if line_count == 0 {
+                    None
+                } else {
+                    Some(line_count)
+                }
+            });
+            // We have to collec to avoid borrowing issues, but you should very rarely have even 10
+            // phantom text on the same line so this should capture 99.9% of cases.
+            let p_vec: SmallVec<[usize; 10]> = p_iter.collect();
+            let p_iter = p_vec.into_iter().flat_map(move |line_count| {
+                let res = (1..=line_count).map(move |x| {
+                    (
+                        DisplayLine::new_unchecked(cur_acc + x),
+                        x + accum_line_count,
+                        line,
+                    )
                 });
+
+                cur_acc += line_count;
+                accum_line_count += line_count;
+
+                res
+            });
 
             let res = std::iter::once(initial).chain(p_iter);
 
