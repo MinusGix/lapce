@@ -23,7 +23,7 @@ use lapce_core::{
 
 use crate::{
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
-    doc::{DocLine, Document, LineExtraStyle},
+    doc::{display_line::DisplayLine, DocLine, Document, LineExtraStyle},
     wave::wave_line,
     window_tab::Focus,
     workspace::LapceWorkspace,
@@ -33,20 +33,32 @@ use super::EditorData;
 
 #[derive(Clone, Debug)]
 enum CursorRender {
-    CurrentLine { line: usize },
-    Selection { x: f64, width: f64, line: usize },
-    Caret { x: f64, width: f64, line: usize },
+    CurrentLine {
+        line: DisplayLine,
+    },
+    Selection {
+        x: f64,
+        width: f64,
+        line: DisplayLine,
+    },
+    Caret {
+        x: f64,
+        width: f64,
+        line: DisplayLine,
+    },
 }
 
 fn cursor_caret(doc: &Document, offset: usize, block: bool) -> CursorRender {
-    let (line, col) = doc.buffer().offset_to_line_col(offset);
-    let phantom_text = doc.line_phantom_text(line);
-    let col = phantom_text.col_after(col, block);
-    let x0 = doc.line_point_of_line_col(line, col, 12).x;
+    let (line, col) = doc.display_line_col_of_offset(offset);
+    let line_info = doc.display_line_info(line);
+    // TODO: block? We don't need to shift col, but unsure if we need to handle block
+    // let col = phantom_text.col_after(col, block);
+    let x0 = doc.line_point_of_display_line_col(line, col, 12).x;
     if block {
         let right_offset = doc.buffer().move_right(offset, Mode::Insert, 1);
-        let (_, right_col) = doc.buffer().offset_to_line_col(right_offset);
-        let x1 = doc.line_point_of_line_col(line, right_col, 12).x;
+        // TODO: this could change the display line and thus the col would wrap!
+        let (_, right_col) = doc.display_line_col_of_offset(right_offset);
+        let x1 = doc.line_point_of_display_line_col(line, right_col, 12).x;
 
         let width = if x1 > x0 { x1 - x0 } else { 7.0 };
         CursorRender::Caret { x: x0, width, line }
@@ -66,18 +78,22 @@ fn visual_cursor(
     end: usize,
     mode: &VisualMode,
     horiz: Option<&ColPosition>,
-    min_line: usize,
-    max_line: usize,
+    min_line: DisplayLine,
+    max_line: DisplayLine,
     char_width: f64,
     is_active: bool,
 ) -> Vec<CursorRender> {
-    let (start_line, start_col) = doc.buffer().offset_to_line_col(start.min(end));
-    let (end_line, end_col) = doc.buffer().offset_to_line_col(start.max(end));
-    let (cursor_line, _) = doc.buffer().offset_to_line_col(end);
+    // let (start_line, start_col) = doc.buffer().offset_to_line_col(start.min(end));
+    // let (end_line, end_col) = doc.buffer().offset_to_line_col(start.max(end));
+    // let (cursor_line, _) = doc.buffer().offset_to_line_col(end);
+    let (start_line, start_col) = doc.display_line_col_of_offset(start.min(end));
+    let (end_line, end_col) = doc.display_line_col_of_offset(start.max(end));
+    let cursor_line = doc.display_line_of_offset(end);
 
     let mut renders = Vec::new();
 
-    for line in min_line..max_line + 1 {
+    for line in min_line.get()..max_line.get() + 1 {
+        let line = DisplayLine::new_unchecked(line);
         if line < start_line {
             continue;
         }
@@ -86,6 +102,7 @@ fn visual_cursor(
             break;
         }
 
+        let line_info = doc.display_line_info(line);
         let left_col = match mode {
             VisualMode::Normal => {
                 if start_line == line {
@@ -96,7 +113,7 @@ fn visual_cursor(
             }
             VisualMode::Linewise => 0,
             VisualMode::Blockwise => {
-                let max_col = doc.buffer().line_end_col(line, false);
+                let max_col = line_info.line_end_display_col(false);
                 let left = start_col.min(end_col);
                 if left > max_col {
                     continue;
@@ -108,27 +125,29 @@ fn visual_cursor(
         let (right_col, line_end) = match mode {
             VisualMode::Normal => {
                 if line == end_line {
-                    let max_col = doc.buffer().line_end_col(line, true);
+                    let max_col = line_info.line_end_display_col(true);
 
                     let end_offset =
                         doc.buffer().move_right(start.max(end), Mode::Visual, 1);
-                    let (_, end_col) = doc.buffer().offset_to_line_col(end_offset);
+                    // TODO: this could go to the next line, which would let the col wrap!
+                    let (_, end_col) = doc.display_line_col_of_offset(end_offset);
 
                     (end_col.min(max_col), false)
                 } else {
-                    (doc.buffer().line_end_col(line, true), true)
+                    (line_info.line_end_display_col(true), true)
                 }
             }
-            VisualMode::Linewise => (doc.buffer().line_end_col(line, true), true),
+            VisualMode::Linewise => (line_info.line_end_display_col(true), true),
             VisualMode::Blockwise => {
-                let max_col = doc.buffer().line_end_col(line, true);
+                let max_col = line_info.line_end_display_col(true);
                 let right = match horiz.as_ref() {
                     Some(&ColPosition::End) => max_col,
                     _ => {
                         let end_offset =
                             doc.buffer().move_right(start.max(end), Mode::Visual, 1);
+                        // TODO: this could go to the next line, which would let the col wrap!
                         let (_, end_col) =
-                            doc.buffer().offset_to_line_col(end_offset);
+                            doc.display_line_col_of_offset(end_offset);
                         end_col.max(start_col).min(max_col)
                     }
                 };
@@ -136,11 +155,12 @@ fn visual_cursor(
             }
         };
 
-        let phantom_text = doc.line_phantom_text(line);
-        let left_col = phantom_text.col_after(left_col, false);
-        let right_col = phantom_text.col_after(right_col, false);
-        let x0 = doc.line_point_of_line_col(line, left_col, 12).x;
-        let mut x1 = doc.line_point_of_line_col(line, right_col, 12).x;
+        // TODO: col_after might have slightly different behavior? I think it uses a > instead of a >=
+        // let phantom_text = doc.line_phantom_text(line);
+        // let left_col = phantom_text.col_after(left_col, false);
+        // let right_col = phantom_text.col_after(right_col, false);
+        let x0 = doc.line_point_of_display_line_col(line, left_col, 12).x;
+        let mut x1 = doc.line_point_of_display_line_col(line, right_col, 12).x;
         if line_end {
             x1 += char_width;
         }
@@ -163,26 +183,33 @@ fn visual_cursor(
 fn insert_cursor(
     doc: &Document,
     selection: &Selection,
-    min_line: usize,
-    max_line: usize,
+    min_line: DisplayLine,
+    max_line: DisplayLine,
     char_width: f64,
     is_active: bool,
 ) -> Vec<CursorRender> {
-    let start = doc.buffer().offset_of_line(min_line);
-    let end = doc.buffer().offset_of_line(max_line + 1);
+    // TODO: is this really what we want here? We could do it in a different manner.
+    // let start = doc.buffer().offset_of_line(min_line);
+    // let end = doc.buffer().offset_of_line(max_line + 1);
+    let start = doc
+        .buffer()
+        .offset_of_line(doc.display_line_to_real(min_line));
+    let end = doc.buffer().offset_of_line(
+        doc.display_line_to_real(DisplayLine::new_unchecked(max_line.get() + 1)),
+    );
     let regions = selection.regions_in_range(start, end);
 
     let mut renders = Vec::new();
 
     for region in regions {
         let cursor_offset = region.end;
-        let (cursor_line, _) = doc.buffer().offset_to_line_col(cursor_offset);
+        let cursor_line = doc.display_line_of_offset(cursor_offset);
         let start = region.start;
         let end = region.end;
-        let (start_line, start_col) =
-            doc.buffer().offset_to_line_col(start.min(end));
-        let (end_line, end_col) = doc.buffer().offset_to_line_col(start.max(end));
-        for line in min_line..max_line + 1 {
+        let (start_line, start_col) = doc.display_line_col_of_offset(start.min(end));
+        let (end_line, end_col) = doc.display_line_col_of_offset(start.max(end));
+        for line in min_line.get()..max_line.get() + 1 {
+            let line = DisplayLine::new_unchecked(line);
             if line < start_line {
                 continue;
             }
@@ -191,25 +218,28 @@ fn insert_cursor(
                 break;
             }
 
+            let line_info = doc.display_line_info(line);
+
             let left_col = match line {
                 _ if line == start_line => start_col,
                 _ => 0,
             };
             let (right_col, line_end) = match line {
                 _ if line == end_line => {
-                    let max_col = doc.buffer().line_end_col(line, true);
+                    let max_col = line_info.line_end_display_col(true);
                     (end_col.min(max_col), false)
                 }
-                _ => (doc.buffer().line_end_col(line, true), true),
+                _ => (line_info.line_end_display_col(true), true),
             };
 
-            // Shift it by the inlay hints
-            let phantom_text = doc.line_phantom_text(line);
-            let left_col = phantom_text.col_after(left_col, false);
-            let right_col = phantom_text.col_after(right_col, false);
+            // TODO: col after may cause slightly different behavior
+            // // Shift it by the inlay hints
+            // let phantom_text = doc.line_phantom_text(line);
+            // let left_col = phantom_text.col_after(left_col, false);
+            // let right_col = phantom_text.col_after(right_col, false);
 
-            let x0 = doc.line_point_of_line_col(line, left_col, 12).x;
-            let mut x1 = doc.line_point_of_line_col(line, right_col, 12).x;
+            let x0 = doc.line_point_of_display_line_col(line, left_col, 12).x;
+            let mut x1 = doc.line_point_of_display_line_col(line, right_col, 12).x;
             if line_end {
                 x1 += char_width;
             }
@@ -522,15 +552,17 @@ fn editor_cursor(
         let config = config.get();
         let line_height = config.editor.line_height() as f64;
 
-        let min_line = (viewport.y0 / line_height).floor() as usize;
-        let max_line = (viewport.y1 / line_height).ceil() as usize;
+        let min_line =
+            DisplayLine::new_unchecked((viewport.y0 / line_height).floor() as usize);
+        let max_line =
+            DisplayLine::new_unchecked((viewport.y1 / line_height).ceil() as usize);
 
         let is_active = is_active();
         let doc = editor.get().doc;
         doc.with(|doc| {
             cursor.with(|cursor| match &cursor.mode {
                 CursorMode::Normal(offset) => {
-                    let line = doc.buffer().line_of_offset(*offset);
+                    let line = doc.display_line_of_offset(*offset);
                     let mut renders =
                         vec![(viewport, CursorRender::CurrentLine { line })];
                     if is_active {
@@ -594,7 +626,9 @@ fn editor_cursor(
                         .width(width)
                         .height_px(line_height as f32)
                         .margin_left(margin_left)
-                        .margin_top((line * line_height) as f32 - viewport.y0 as f32)
+                        .margin_top(
+                            (line.get() * line_height) as f32 - viewport.y0 as f32,
+                        )
                         .background(background)
                 })
             },
@@ -789,7 +823,7 @@ fn editor_content(cx: AppContext, editor: RwSignal<EditorData>) -> impl View {
         if let CursorRender::Caret { x, width, line } = caret {
             let rect = Size::new(width, line_height as f64)
                 .to_rect()
-                .with_origin(Point::new(x, (line * line_height) as f64));
+                .with_origin(Point::new(x, (line.get() * line_height) as f64));
 
             let viewport = viewport.get_untracked();
             let smallest_distance = (viewport.y0 - rect.y0)

@@ -34,9 +34,15 @@ use crate::{
     command::WindowCommand,
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     db::LapceDb,
-    debug::RunDebugMode,
-    doc::DocContent,
-    editor::{view::editor_view, EditorData},
+    debug::{RunDebugMode, StackTraceData},
+    doc::{
+        display_line::DisplayLine, DocContent, DocLine, Document, LineExtraStyle,
+    },
+    editor::{
+        location::{EditorLocation, EditorPosition},
+        view::editor_view,
+        EditorData,
+    },
     editor_tab::{EditorTabChild, EditorTabData},
     focus_text::focus_text,
     id::{EditorId, EditorTabId, SplitId},

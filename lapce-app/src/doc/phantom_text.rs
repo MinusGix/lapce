@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use floem::peniko::Color;
 use lsp_types::DiagnosticSeverity;
 use smallvec::SmallVec;
 
 /// `PhantomText` is for text that is not in the actual document, but should be rendered with it.  
 /// Ex: Inlay hints, IME text, error lens' diagnostics, etc
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhantomText {
     /// The kind is currently used for sorting the phantom text on a line
     pub kind: PhantomTextKind,
@@ -16,8 +19,14 @@ pub struct PhantomText {
     pub bg: Option<Color>,
     pub under_line: Option<Color>,
 }
+impl PhantomText {
+    /// The amount of lines beyond the expected `1` that the phantom text will take up
+    pub fn extra_line_count(&self) -> usize {
+        self.text.lines().count().saturating_sub(1)
+    }
+}
 
-#[derive(Ord, Eq, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub enum PhantomTextKind {
     /// Input methods
     Ime,
@@ -32,7 +41,7 @@ pub enum PhantomTextKind {
 /// Information about the phantom text on a specific line.  
 /// This has various utility functions for transforming a coordinate (typically a column) into the
 /// resulting coordinate after the phantom text is combined with the line's real content.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct PhantomTextLine {
     /// This uses a smallvec because most lines rarely have more than a couple phantom texts
     pub text: SmallVec<[PhantomText; 6]>,
@@ -104,7 +113,7 @@ impl PhantomTextLine {
         text
     }
 
-    /// Iterator over (col_shift, size, hint, pre_column)
+    /// Iterator over (col_shift, size, phantom.col, phantom)
     /// Note that this only iterates over the ordered text, since those depend on the text for where
     /// they'll be positioned
     pub fn offset_size_iter(
@@ -122,5 +131,53 @@ impl PhantomTextLine {
                 phantom,
             )
         })
+    }
+
+    /// Iterator over (col_shift, size, phantom.col, phantom)
+    /// Note that this only iterates over the ordered text, since those depend on the text for where
+    /// they'll be positioned
+    pub fn offset_size_into_iter(self) -> PhantomOffsetSizeIntoIter {
+        PhantomOffsetSizeIntoIter {
+            iter: self.text.into_iter(),
+            col_shift: 0,
+        }
+    }
+}
+
+pub struct PhantomOffsetSizeIntoIter {
+    iter: smallvec::IntoIter<[PhantomText; 6]>,
+    col_shift: usize,
+}
+impl Iterator for PhantomOffsetSizeIntoIter {
+    type Item = (usize, usize, usize, PhantomText);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|phantom| {
+            let pre_col_shift = self.col_shift;
+            self.col_shift += phantom.text.len();
+            (
+                pre_col_shift,
+                self.col_shift - pre_col_shift,
+                phantom.col,
+                phantom,
+            )
+        })
+    }
+}
+
+pub trait PhantomTextProvider {
+    fn phantom_text(&self, line: usize) -> Arc<PhantomTextLine>;
+}
+
+#[cfg(test)]
+impl PhantomTextProvider for std::collections::HashMap<usize, PhantomTextLine> {
+    fn phantom_text(&self, line: usize) -> Arc<PhantomTextLine> {
+        // We wrap this in an Arc here to make the tests simpler to write, since the tests
+        // are cheap.
+        Arc::new(
+            self.get(&line)
+                .cloned()
+                .unwrap_or_else(PhantomTextLine::default),
+        )
     }
 }

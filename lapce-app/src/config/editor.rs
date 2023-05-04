@@ -87,6 +87,10 @@ pub struct EditorConfig {
         desc = "Set the inlay hint font size. If less than 5 or greater than editor font size, it uses the editor font size."
     )]
     pub inlay_hint_font_size: usize,
+    #[field_names(
+        desc = "Whether inlay hints should go to the next line if there are newlines."
+    )]
+    pub multiline_inlay_hints: bool,
     #[field_names(desc = "If diagnostics should be displayed inline")]
     pub enable_error_lens: bool,
     #[field_names(
@@ -101,6 +105,11 @@ pub struct EditorConfig {
         desc = "Set the error lens font size. If 0 it uses the inlay hint font size."
     )]
     pub error_lens_font_size: usize,
+    // TODO: It would be nice to have a setting which inserts a newline at the start of the error lens, so you have the error lens completely below the line (like in some terminal editors)
+    #[field_names(
+        desc = "Whether error lens should go to the next line if there are newlines."
+    )]
+    pub multiline_error_lens: bool,
     #[field_names(
         desc = "If the editor should display the completion item as phantom text"
     )]
@@ -113,6 +122,10 @@ pub struct EditorConfig {
         desc = "Set the completion lens font size. If 0 it uses the inlay hint font size."
     )]
     pub completion_lens_font_size: usize,
+    #[field_names(
+        desc = "Whether completion lens should go to the next line if there are newlines."
+    )]
+    pub multiline_completion_lens: bool,
     #[field_names(
         desc = "Set the cursor blink interval (in milliseconds). Set to 0 to completely disable."
     )]

@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    borrow::Cow, cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc,
+    sync::Arc,
+};
 
 use floem::{
     cosmic_text::{Attrs, AttrsList, FamilyOwned, TextLayout},
@@ -47,8 +50,14 @@ use crate::{
     workspace::LapceWorkspace,
 };
 
-use self::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};
+use self::{
+    display_line::{DisplayLine, DisplayLineInfo},
+    phantom_text::{
+        PhantomText, PhantomTextKind, PhantomTextLine, PhantomTextProvider,
+    },
+};
 
+pub mod display_line;
 mod phantom_text;
 
 pub struct SystemClipboard {}
@@ -106,10 +115,10 @@ pub struct TextLayoutCache {
     /// The id of the last config, which lets us know when the config changes so we can update
     /// the cache.
     config_id: u64,
-    /// (Font Size -> (Line Number -> Text Layout))  
+    /// (Font Size -> (Display Line Number -> Text Layout))  
     /// Different font-sizes are cached separately, which is useful for features like code lens
     /// where the text becomes small but you may wish to revert quickly.
-    pub layouts: HashMap<usize, HashMap<usize, Arc<TextLayoutLine>>>,
+    pub layouts: HashMap<usize, HashMap<DisplayLine, Arc<TextLayoutLine>>>,
     pub max_width: f64,
 }
 
@@ -124,6 +133,37 @@ impl TextLayoutCache {
 
     fn clear(&mut self) {
         self.layouts.clear();
+    }
+
+    pub fn check_attributes(&mut self, config_id: u64) {
+        if self.config_id != config_id {
+            self.clear();
+            self.config_id = config_id;
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PhantomTextCache {
+    /// The id of the last config, which lets us know when the config changes so we can update
+    /// the cache.
+    config_id: u64,
+    /// (buffer line -> PhantomTextLine for that line)  
+    /// Buffer line is used as the key rather than display line, because various parts of the
+    /// display line logic get the phantom text for their buffer line.  
+    /// This is also simpler to invalidate pieces.
+    phantom_text: HashMap<usize, Arc<PhantomTextLine>>,
+}
+impl PhantomTextCache {
+    pub fn new() -> Self {
+        Self {
+            config_id: 0,
+            phantom_text: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.phantom_text.clear();
     }
 
     pub fn check_attributes(&mut self, config_id: u64) {
@@ -186,6 +226,7 @@ pub struct Document {
     /// This is an `Rc<RefCell<_>>` due to needing to access it even when the document is borrowed,
     /// since we may need to fill it with constructed text layouts.
     pub text_layouts: Rc<RefCell<TextLayoutCache>>,
+    phantom_text: Rc<RefCell<PhantomTextCache>>,
     proxy: ProxyRpcHandler,
     config: ReadSignal<Arc<LapceConfig>>,
 }
@@ -202,7 +243,7 @@ impl VirtualListVector<DocLine> for Document {
     type ItemIterator = std::vec::IntoIter<DocLine>;
 
     fn total_len(&self) -> usize {
-        self.buffer.num_lines()
+        self.last_display_line().get() + 1
     }
 
     fn slice(&mut self, range: std::ops::Range<usize>) -> Self::ItemIterator {
@@ -212,7 +253,7 @@ impl VirtualListVector<DocLine> for Document {
                 rev: self.buffer.rev(),
                 style_rev: self.style_rev,
                 line,
-                text: self.get_text_layout(line, 12),
+                text: self.get_text_layout(DisplayLine::new_unchecked(line), 12),
                 code_actions: self.code_actions.get(&line).cloned(),
             })
             .collect::<Vec<_>>();
@@ -241,6 +282,7 @@ impl Document {
             content: DocContent::File(path),
             loaded: false,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
+            phantom_text: Rc::new(RefCell::new(PhantomTextCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
             config,
@@ -267,6 +309,7 @@ impl Document {
             },
             loaded: true,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
+            phantom_text: Rc::new(RefCell::new(PhantomTextCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
             config,
@@ -443,13 +486,20 @@ impl Document {
         self.style_rev += 1;
     }
 
+    fn clear_phantom_text_cache(&mut self) {
+        // TODO: existing uses of this function could be smarter about which lines actually need to
+        // be invalidated.
+        self.phantom_text.borrow_mut().clear();
+    }
+
     fn clear_code_actions(&mut self) {
         self.code_actions.clear();
     }
 
-    pub fn line_horiz_col(
+    /// Get the display column for the [`ColPosition`]
+    pub fn display_line_horiz_col(
         &self,
-        line: usize,
+        line: DisplayLine,
         font_size: usize,
         horiz: &ColPosition,
         caret: bool,
@@ -460,12 +510,22 @@ impl Document {
                 let hit_point = text_layout.text.hit_point(Point::new(x, 0.0));
                 let n = hit_point.index;
 
-                n.min(self.buffer.line_end_col(line, caret))
+                let line_info = self.display_line_info(line);
+
+                // TODO: Caret!
+                n.min(line_info.max_display_col())
             }
-            ColPosition::End => self.buffer.line_end_col(line, caret),
+            // ColPosition::End => self.buffer.line_end_col(line, caret),
+            ColPosition::End => {
+                let line_info = self.display_line_info(line);
+                // TODO: caret!
+                line_info.max_display_col()
+            }
             ColPosition::Start => 0,
             ColPosition::FirstNonBlank => {
-                self.buffer.first_non_blank_character_on_line(line)
+                let line_info = self.display_line_info(line);
+                // self.buffer.first_non_blank_character_on_line(line)
+                line_info.first_non_blank_character_on_line(&self.buffer)
             }
         }
     }
@@ -576,40 +636,46 @@ impl Document {
             Movement::Up => {
                 let font_size = config.editor.font_size;
 
-                let line = self.buffer.line_of_offset(offset);
-                if line == 0 {
-                    let line = self.buffer.line_of_offset(offset);
-                    let new_offset = self.buffer.offset_of_line(line);
+                // let line = self.buffer.line_of_offset(offset);
+                let line = self.display_line_of_offset(offset);
+                if line.get() == 0 {
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
                             self.line_point_of_offset(offset, font_size).x,
                         )
                     });
-                    return (new_offset, Some(horiz));
+                    return (0, Some(horiz));
                 }
 
-                let line = line.saturating_sub(count);
+                let line =
+                    DisplayLine::new_unchecked(line.get().saturating_sub(count));
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
                 });
-                let col = self.line_horiz_col(
+                let col = self.display_line_horiz_col(
                     line,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
+                // let new_offset = self.buffer.offset_of_line_col(line, col);
+                let new_offset = self.nearest_offset_of_display_line_col(line, col);
                 (new_offset, Some(horiz))
             }
             Movement::Down => {
                 let font_size = config.editor.font_size;
 
-                let last_line = self.buffer.last_line();
-                let line = self.buffer.line_of_offset(offset);
+                // let last_line = self.buffer.last_line();
+                let last_line = self.last_display_line();
+                // let line = self.buffer.line_of_offset(offset);
+                let line = self.display_line_of_offset(offset);
                 if line == last_line {
+                    // TODO: should this be the end of the display line? but wont' this just go to the same place?
                     let new_offset =
                         self.buffer.offset_line_end(offset, mode != Mode::Normal);
+                    // TODO: caret!
+                    // let new_col = self
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
                             self.line_point_of_offset(offset, font_size).x,
@@ -618,20 +684,21 @@ impl Document {
                     return (new_offset, Some(horiz));
                 }
 
-                let line = line + count;
+                let line = DisplayLine::new_unchecked(line.get() + count);
 
                 let line = line.min(last_line);
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
                 });
-                let col = self.line_horiz_col(
+                let col = self.display_line_horiz_col(
                     line,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
+                // let new_offset = self.buffer.offset_of_line_col(line, col);
+                let new_offset = self.nearest_offset_of_display_line_col(line, col);
                 (new_offset, Some(horiz))
             }
             Movement::DocumentStart => (0, Some(ColPosition::Start)),
@@ -678,17 +745,18 @@ impl Document {
                     LinePosition::Last => self.buffer.last_line(),
                 };
                 let font_size = config.editor.font_size;
-                let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
-                });
-                let col = self.line_horiz_col(
-                    line,
-                    font_size,
-                    &horiz,
-                    mode != Mode::Normal,
-                );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
-                (new_offset, Some(horiz))
+                // let horiz = horiz.cloned().unwrap_or_else(|| {
+                //     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                // });
+                // let col = self.display_line_horiz_col(
+                //     line,
+                //     font_size,
+                //     &horiz,
+                //     mode != Mode::Normal,
+                // );
+                // let new_offset = self.buffer.offset_of_line_col(line, col);
+                // (new_offset, Some(horiz))
+                todo!()
             }
             Movement::Offset(offset) => {
                 let new_offset = *offset;
@@ -850,6 +918,51 @@ impl Document {
         }
     }
 
+    pub fn display_line_info(&self, dline: DisplayLine) -> DisplayLineInfo {
+        DisplayLineInfo::new(self, &self.buffer, dline)
+    }
+
+    pub fn display_line_of_offset(&self, offset: usize) -> DisplayLine {
+        DisplayLine::display_line_col_of_offset(self, &self.buffer, offset).0
+    }
+
+    /// Convert a (line, col) in the buffer into the relevant (display line, display column).
+    pub fn display_line_col_of_line_col(
+        &self,
+        line: usize,
+        col: usize,
+    ) -> (DisplayLine, usize) {
+        DisplayLine::display_line_col_of_line_col(self, &self.buffer, line, col)
+    }
+
+    pub fn display_line_col_of_offset(&self, offset: usize) -> (DisplayLine, usize) {
+        DisplayLine::display_line_col_of_offset(self, &self.buffer, offset)
+    }
+
+    // TODO: cache this calculation. We can just update it in on_update or whatever
+    pub fn last_display_line(&self) -> DisplayLine {
+        DisplayLine::last_display_line(self, &self.buffer)
+    }
+
+    /// Get the real line number of the given display line.  
+    /// Note that a real line can represent multiple display lines!  
+    /// As well, if this display line is completely phantom text, then there won't even be any text
+    /// from the line on it.
+    pub fn display_line_to_real(&self, dline: DisplayLine) -> usize {
+        dline.find_real_line(self, &self.buffer).0
+    }
+
+    pub fn nearest_offset_of_display_line_col(
+        &self,
+        dline: DisplayLine,
+        col: usize,
+    ) -> usize {
+        let line_info = self.display_line_info(dline);
+        let real_line = line_info.line;
+        let real_col = line_info.display_col_to_col(col);
+        self.buffer.offset_of_line_col(real_line, real_col)
+    }
+
     /// Returns the point into the text layout of the line at the given offset.
     /// `x` being the leading edge of the character, and `y` being the baseline.
     pub fn line_point_of_offset(&self, offset: usize, font_size: usize) -> Point {
@@ -865,8 +978,20 @@ impl Document {
         col: usize,
         font_size: usize,
     ) -> Point {
+        let (dline, dcol) = self.display_line_col_of_line_col(line, col);
+        self.line_point_of_display_line_col(dline, dcol, font_size)
+    }
+
+    /// Returns the point into the text layout of the line at the given display line and column.
+    /// `x` being the leading edge of the character, and `y` being the baseline.
+    pub fn line_point_of_display_line_col(
+        &self,
+        line: DisplayLine,
+        dcol: usize,
+        font_size: usize,
+    ) -> Point {
         let text_layout = self.get_text_layout(line, font_size);
-        text_layout.text.hit_position(col).point
+        text_layout.text.hit_position(dcol).point
     }
 
     /// Get the (point above, point below) of a particular offset within the editor.
@@ -875,42 +1000,52 @@ impl Document {
         self.points_of_line_col(line, col)
     }
 
-    /// Get the (point above, point below) of a particular (line, col) within the editor.
     pub fn points_of_line_col(&self, line: usize, col: usize) -> (Point, Point) {
+        let (dline, dcol) = self.display_line_col_of_line_col(line, col);
+        self.points_of_display_line_col(dline, dcol)
+    }
+
+    /// Get the (point above, point below) of a particular (display line, dcol) within the editor.
+    pub fn points_of_display_line_col(
+        &self,
+        line: DisplayLine,
+        dcol: usize,
+    ) -> (Point, Point) {
         let config = self.config.get_untracked();
         let (y, line_height, font_size) = (
-            config.editor.line_height() * line,
+            config.editor.line_height() * line.get(),
             config.editor.line_height(),
             config.editor.font_size,
         );
 
-        let line = line.min(self.buffer.last_line());
-
-        let phantom_text = self.line_phantom_text(line);
-        let col = phantom_text.col_after(col, false);
+        // TODO: shouldn't this modify the dcol too?
+        // let line = line.min(self.buffer.last_line());
+        let line = line.min(self.last_display_line());
 
         let mut x_shift = 0.0;
-        if font_size < config.editor.font_size {
-            let line_content = self.buffer.line_content(line);
-            let mut col = 0usize;
-            for ch in line_content.chars() {
-                if ch == ' ' || ch == '\t' {
-                    col += 1;
-                } else {
-                    break;
-                }
-            }
+        // TODO:
+        // if font_size < config.editor.font_size {
+        //     let line_content = self.buffer.line_content(line);
+        //     let mut col = 0usize;
+        //     for ch in line_content.chars() {
+        //         if ch == ' ' || ch == '\t' {
+        //             col += 1;
+        //         } else {
+        //             break;
+        //         }
+        //     }
 
-            if col > 0 {
-                let normal_text_layout =
-                    self.get_text_layout(line, config.editor.font_size);
-                let small_text_layout = self.get_text_layout(line, font_size);
-                x_shift = normal_text_layout.text.hit_position(col).point.x
-                    - small_text_layout.text.hit_position(col).point.x;
-            }
-        }
+        //     if col > 0 {
+        //         let normal_text_layout =
+        //             self.get_text_layout(line, config.editor.font_size);
+        //         let small_text_layout = self.get_text_layout(line, font_size);
+        //         x_shift = normal_text_layout.text.hit_position(col).point.x
+        //             - small_text_layout.text.hit_position(col).point.x;
+        //     }
+        // }
 
-        let x = self.line_point_of_line_col(line, col, font_size).x + x_shift;
+        let x =
+            self.line_point_of_display_line_col(line, dcol, font_size).x + x_shift;
         (
             Point::new(x, y as f64),
             Point::new(x, (y + line_height) as f64),
@@ -919,32 +1054,15 @@ impl Document {
 
     /// Create a new text layout for the given line.  
     /// Typically you should use [`Document::get_text_layout`] instead.
-    fn new_text_layout(&self, line: usize, _font_size: usize) -> TextLayoutLine {
+    fn new_text_layout(
+        &self,
+        line: DisplayLine,
+        _font_size: usize,
+    ) -> TextLayoutLine {
         let config = self.config.get_untracked();
-        let line_content_original = self.buffer.line_content(line);
+        let line_info = self.display_line_info(line);
 
-        // Get the line content with newline characters replaced with spaces
-        // and the content without the newline characters
-        let (line_content, _line_content_original) =
-            if let Some(s) = line_content_original.strip_suffix("\r\n") {
-                (
-                    format!("{s}  "),
-                    &line_content_original[..line_content_original.len() - 2],
-                )
-            } else if let Some(s) = line_content_original.strip_suffix('\n') {
-                (
-                    format!("{s} ",),
-                    &line_content_original[..line_content_original.len() - 1],
-                )
-            } else {
-                (
-                    line_content_original.to_string(),
-                    &line_content_original[..],
-                )
-            };
-        // Combine the phantom text with the line content
-        let phantom_text = self.line_phantom_text(line);
-        let line_content = phantom_text.combine_with_text(line_content);
+        let line_content = line_info.line_content(&self.buffer, true);
 
         let color = config.get_color(LapceColor::EDITOR_FOREGROUND);
         let family: Vec<FamilyOwned> =
@@ -956,12 +1074,14 @@ impl Document {
         let mut attrs_list = AttrsList::new(attrs);
 
         // Apply various styles to the line's text based on our semantic/syntax highlighting
-        let styles = self.line_style(line);
+        let styles = self.line_style(line_info.line);
         for line_style in styles.iter() {
             if let Some(fg_color) = line_style.style.fg_color.as_ref() {
                 if let Some(fg_color) = config.get_style_color(fg_color) {
-                    let start = phantom_text.col_at(line_style.start);
-                    let end = phantom_text.col_at(line_style.end);
+                    // let start = phantom_text.col_at(line_style.start);
+                    // let end = phantom_text.col_at(line_style.end);
+                    let start = line_info.col_to_display_col_clamp(line_style.start);
+                    let end = line_info.col_to_display_col_clamp(line_style.end);
                     attrs_list.add_span(start..end, attrs.color(*fg_color));
                 }
             }
@@ -970,7 +1090,7 @@ impl Document {
         let font_size = config.editor.font_size;
 
         // Apply phantom text specific styling
-        for (offset, size, col, phantom) in phantom_text.offset_size_iter() {
+        for (offset, size, col, phantom) in line_info.phantom.offset_size_iter() {
             let start = col + offset;
             let end = start + size;
 
@@ -996,7 +1116,7 @@ impl Document {
         // Keep track of background styling from phantom text, which is done separately
         // from the text layout attributes
         let mut extra_style = Vec::new();
-        for (offset, size, col, phantom) in phantom_text.offset_size_iter() {
+        for (offset, size, col, phantom) in line_info.phantom.offset_size_iter() {
             if phantom.bg.is_some() || phantom.under_line.is_some() {
                 let start = col + offset;
                 let end = start + size;
@@ -1013,7 +1133,7 @@ impl Document {
         }
 
         // Add the styling for the diagnostic severity, if applicable
-        if let Some(max_severity) = phantom_text.max_severity {
+        if let Some(max_severity) = line_info.phantom.max_severity {
             let theme_prop = if max_severity == DiagnosticSeverity::ERROR {
                 LapceColor::ERROR_LENS_ERROR_BACKGROUND
             } else if max_severity == DiagnosticSeverity::WARNING {
@@ -1034,48 +1154,48 @@ impl Document {
             });
         }
 
-        self.diagnostics.diagnostics.with_untracked(|diags| {
-            for diag in diags {
-                if diag.diagnostic.range.start.line as usize <= line
-                    && line <= diag.diagnostic.range.end.line as usize
-                {
-                    let start = if diag.diagnostic.range.start.line as usize == line
-                    {
-                        let (_, col) = self.buffer.offset_to_line_col(diag.range.0);
-                        col
-                    } else {
-                        let offset =
-                            self.buffer.first_non_blank_character_on_line(line);
-                        let (_, col) = self.buffer.offset_to_line_col(offset);
-                        col
-                    };
-                    let start = phantom_text.col_after(start, true);
-
-                    let end = if diag.diagnostic.range.end.line as usize == line {
-                        let (_, col) = self.buffer.offset_to_line_col(diag.range.1);
-                        col
-                    } else {
-                        self.buffer.line_end_col(line, true)
-                    };
-                    let end = phantom_text.col_after(end, false);
-
-                    let x0 = text_layout.hit_position(start).point.x;
-                    let x1 = text_layout.hit_position(end).point.x;
-                    let color_name = match diag.diagnostic.severity {
-                        Some(DiagnosticSeverity::ERROR) => LapceColor::LAPCE_ERROR,
-                        _ => LapceColor::LAPCE_WARN,
-                    };
-                    let color = *config.get_color(color_name);
-                    extra_style.push(LineExtraStyle {
-                        x: x0,
-                        width: Some(x1 - x0),
-                        bg_color: None,
-                        under_line: None,
-                        wave_line: Some(color),
-                    });
-                }
-            }
-        });
+        // TODO: We might have to store the display line with the diagnostic or something?
+        // or get how it is being put across multiple lines somehow?
+        // self.diagnostics.diagnostics.with_untracked(|diags| {
+        //     for diag in diags {
+        //         if diag.diagnostic.range.start.line as usize <= line
+        //             && line <= diag.diagnostic.range.end.line as usize
+        //         {
+        //             let start = if diag.diagnostic.range.start.line as usize == line
+        //             {
+        //                 let (_, col) = self.buffer.offset_to_line_col(diag.range.0);
+        //                 col
+        //             } else {
+        //                 let offset =
+        //                     self.buffer.first_non_blank_character_on_line(line);
+        //                 let (_, col) = self.buffer.offset_to_line_col(offset);
+        //                 col
+        //             };
+        //             let start = phantom_text.col_after(start, true);
+        //             let end = if diag.diagnostic.range.end.line as usize == line {
+        //                 let (_, col) = self.buffer.offset_to_line_col(diag.range.1);
+        //                 col
+        //             } else {
+        //                 self.buffer.line_end_col(line, true)
+        //             };
+        //             let end = phantom_text.col_after(end, false);
+        //             let x0 = text_layout.hit_position(start).point.x;
+        //             let x1 = text_layout.hit_position(end).point.x;
+        //             let color_name = match diag.diagnostic.severity {
+        //                 Some(DiagnosticSeverity::ERROR) => LapceColor::LAPCE_ERROR,
+        //                 _ => LapceColor::LAPCE_WARN,
+        //             };
+        //             let color = *config.get_color(color_name);
+        //             extra_style.push(LineExtraStyle {
+        //                 x: x0,
+        //                 width: Some(x1 - x0),
+        //                 bg_color: None,
+        //                 under_line: None,
+        //                 wave_line: Some(color),
+        //             });
+        //         }
+        //     }
+        // });
 
         TextLayoutLine {
             text: text_layout,
@@ -1089,7 +1209,7 @@ impl Document {
     /// If the text layout is not cached, it will be created and cached.
     pub fn get_text_layout(
         &self,
-        line: usize,
+        line: DisplayLine,
         font_size: usize,
     ) -> Arc<TextLayoutLine> {
         let config = self.config.get_untracked();
@@ -1236,7 +1356,9 @@ impl Document {
 
     /// Request inlay hints for the buffer from the LSP through the proxy.
     fn get_inlay_hints(cx: Scope, doc: RwSignal<Document>, proxy: &ProxyRpcHandler) {
+        println!("Get inlay hints");
         if !doc.with_untracked(|doc| doc.loaded) {
+            println!("\tDoc wasn't loaded");
             return;
         }
 
@@ -1250,16 +1372,20 @@ impl Document {
         });
 
         let send = create_ext_action(cx, move |hints| {
+            println!("Got inlay hints, updating doc");
             doc.update(|doc| {
                 if doc.buffer.rev() == rev {
+                    println!("Set inlay hints");
                     doc.inlay_hints = Some(hints);
                     doc.clear_text_layout_cache();
+                    doc.clear_phantom_text_cache();
                 }
             })
         });
 
         proxy.get_inlay_hints(path, move |result| {
             if let Ok(ProxyResponse::GetInlayHints { mut hints }) = result {
+                println!("Got inaly hints response");
                 // Sort the inlay hints by their position, as the LSP does not guarantee that it will
                 // provide them in the order that they are in within the file
                 // as well, Spans does not iterate in the order that they appear
@@ -1279,8 +1405,34 @@ impl Document {
         });
     }
 
-    /// Get the phantom text for a given line
-    pub fn line_phantom_text(&self, line: usize) -> PhantomTextLine {
+    // TODO: do these really need to be Arcs? We obviously can't return a reference since that could
+    // be invalidated.
+    /// Get the phantom text for a given line.
+    fn buffer_line_phantom_text(&self, line: usize) -> Arc<PhantomTextLine> {
+        let config = self.config.get_untracked();
+
+        // Check if the phantom text needs to update due to the config being changed
+        self.phantom_text.borrow_mut().check_attributes(config.id);
+
+        let cache_exists =
+            self.phantom_text.borrow().phantom_text.get(&line).is_some();
+        if !cache_exists {
+            let phantom = self.create_buffer_line_phantom_text(line);
+            let phantom = Arc::new(phantom);
+            let mut cache = self.phantom_text.borrow_mut();
+            cache.phantom_text.insert(line, phantom);
+        }
+
+        self.phantom_text
+            .borrow()
+            .phantom_text
+            .get(&line)
+            .cloned()
+            .unwrap()
+    }
+
+    /// Get the phantom text for a given line. This does not cache the result.
+    fn create_buffer_line_phantom_text(&self, line: usize) -> PhantomTextLine {
         let config = self.config.get_untracked();
 
         let start_offset = self.buffer.offset_of_line(line);
@@ -1371,8 +1523,13 @@ impl Document {
 
                     *config.get_color(theme_prop)
                 };
-                let text =
-                    format!("    {}", diag.diagnostic.message.lines().join(" "));
+                // let text =
+                //     format!("    {}", diag.diagnostic.message.lines().join(" "));
+                let text = if config.editor.multiline_error_lens {
+                    diag.diagnostic.message.clone()
+                } else {
+                    diag.diagnostic.message.lines().join(" ")
+                };
                 PhantomText {
                     kind: PhantomTextKind::Diagnostic,
                     col,
@@ -1479,6 +1636,7 @@ impl Document {
     /// init diagnostics offset ranges from lsp positions
     pub fn init_diagnostics(&mut self) {
         self.clear_text_layout_cache();
+        self.clear_phantom_text_cache();
         self.clear_code_actions();
         self.diagnostics.diagnostics.update(|diagnostics| {
             for diagnostic in diagnostics.iter_mut() {
@@ -1491,5 +1649,15 @@ impl Document {
                 diagnostic.range = (start, end);
             }
         });
+    }
+}
+
+impl PhantomTextProvider for Document {
+    fn phantom_text(&self, line: usize) -> Arc<PhantomTextLine> {
+        // TODO: this function has the issue that it would allocate a bunch of strings
+        // that we often immediately get rid of!
+        // It would be useful to cache the resulting phantom text, or just cache the relevant
+        // line calculation bits for display line.
+        self.buffer_line_phantom_text(line)
     }
 }
