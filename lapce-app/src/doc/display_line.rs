@@ -365,13 +365,19 @@ impl DisplayLineInfo {
         let line_content = &line_content[self.range.clone()];
 
         let line_content = if soften_newlines {
-            if let Some(s) = line_content.strip_suffix("\r\n") {
-                Cow::Owned(format!("{s}  "))
-            } else if let Some(s) = line_content.strip_suffix("\n") {
-                Cow::Owned(format!("{s} "))
-            } else {
-                Cow::Borrowed(line_content)
-            }
+            // TODO: if we aren't doing this, do we really need soften_newlines?
+            // let is_last = self.range.end == orig_line_content.trim_end().len();
+            // if is_last {
+            //     if let Some
+            // }
+            // if let Some(s) = line_content.strip_suffix("\r\n") {
+            //     Cow::Owned(format!("{s}  "))
+            // } else if let Some(s) = line_content.strip_suffix("\n") {
+            //     Cow::Owned(format!("{s} "))
+            // } else {
+            //     Cow::Borrowed(line_content)
+            // }
+            Cow::Owned(format!("{line_content}  "))
         } else {
             Cow::Borrowed(line_content)
         };
@@ -393,6 +399,8 @@ impl DisplayLineInfo {
 mod tests {
     use std::collections::HashMap;
 
+    use floem::peniko::Color;
+    use lsp_types::DiagnosticSeverity;
     use smallvec::smallvec;
 
     use crate::doc::phantom_text::{PhantomText, PhantomTextKind};
@@ -478,14 +486,10 @@ mod tests {
             )
         }
 
-        /// Get the phantom text for a specific line and combine it with the buffer text.
-        fn combined(&self, line: usize) -> String {
-            let text = self.buffer.line_content(line);
-            let text = text.strip_suffix("\n").unwrap_or(&text);
-            self.phantom_prov
-                .get(&line)
-                .unwrap()
-                .combine_with_text(text.to_string())
+        /// Get the phantom text for a display line and combine it with the buffer text.
+        fn combined(&self, dline: usize) -> String {
+            let line_info = self.line_info(dline);
+            line_info.line_content(&self.buffer, true)
         }
     }
 
@@ -646,7 +650,7 @@ mod tests {
         };
         bun.phantom_prov.insert(0, p.clone());
 
-        assert_eq!(bun.combined(0), "tesblaht thing");
+        assert_eq!(bun.combined(0), "tesblaht thing  ");
 
         bun.test_display_line_iter(&[(0, 0, 0)]);
 
@@ -704,7 +708,8 @@ mod tests {
             },
         );
 
-        assert_eq!(bun.combined(0), "tesblah\naat thing");
+        assert_eq!(bun.combined(0), "tesblah  ");
+        assert_eq!(bun.combined(1), "aat thing  ");
 
         bun.test_display_line_iter(&[(0, 0, 0), (1, 1, 0)]);
 
@@ -802,8 +807,10 @@ mod tests {
             },
         );
 
-        assert_eq!(bun.combined(0), "tesblah\naat tht\nabc\nmeing");
-        // roughly: "tes[blah\naa]t th[t\nabc\nme]ing"
+        assert_eq!(bun.combined(0), "tesblah  ");
+        assert_eq!(bun.combined(1), "aat tht  ");
+        assert_eq!(bun.combined(2), "abc  ");
+        assert_eq!(bun.combined(3), "meing  ");
 
         bun.test_display_line_iter(&[(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 3, 0)]);
 
@@ -940,8 +947,6 @@ mod tests {
             },
         );
 
-        // roughly: "tes[blah\nthing]t thing\nhi"
-
         bun.test_display_line_iter(&[(0, 0, 0), (1, 1, 0), (2, 0, 1)]);
 
         let mut bun = Bundle {
@@ -981,8 +986,10 @@ mod tests {
         );
 
         // roughly: "tes[blah\nthing]t thing\nh[aa\n111]i"
-        assert_eq!(bun.combined(0), "tesblah\nthingt thing");
-        assert_eq!(bun.combined(1), "haa\n111i");
+        assert_eq!(bun.combined(0), "tesblah  ");
+        assert_eq!(bun.combined(1), "thingt thing  ");
+        assert_eq!(bun.combined(2), "haa  ");
+        assert_eq!(bun.combined(3), "111i  ");
 
         bun.test_display_line_iter(&[(0, 0, 0), (1, 1, 0), (2, 0, 1), (3, 1, 1)]);
 
@@ -1080,14 +1087,191 @@ mod tests {
             (0, 7, (1, 9)),   // i
             (0, 8, (1, 10)),  // n
             (0, 9, (1, 11)),  // g
-            (0, 10, (1, 12)), // end of line
-            (0, 11, (1, 12)), // saturate
+            (0, 10, (1, 12)), // end of line replaced with space
+            (0, 11, (1, 12)), // end of line
             (0, 12, (1, 12)), // saturate
             (1, 0, (2, 0)),   // h goes to next (real) line
             (1, 1, (3, 3)),   // i move down a line, then shifted forward by '111'
             (1, 2, (3, 4)),   // end
             (1, 2, (3, 4)),   // saturate
         ]);
+
+        let mut bun = Bundle {
+            buffer: Buffer::new("#[test\nhi"),
+            phantom_prov: HashMap::new(),
+        };
+        bun.phantom_prov.insert(
+            0,
+            PhantomTextLine {
+                text: smallvec![PhantomText {
+                    kind: PhantomTextKind::Diagnostic,
+                    col: 7,
+                    text: "blah".to_string(),
+                    font_size: None,
+                    fg: None,
+                    bg: None,
+                    under_line: None
+                }],
+                max_severity: Some(DiagnosticSeverity::WARNING),
+            },
+        );
+
+        assert_eq!(bun.combined(0), "#[test blah ");
+        assert_eq!(bun.combined(1), "hi  ");
+
+        bun.test_display_line_iter(&[(0, 0, 0), (1, 0, 1)]);
+
+        bun.assert_last_line_eq(1);
+
+        assert_eq!(
+            bun.line_info(0),
+            DisplayLineInfo {
+                line: 0,
+                line_shift: 0,
+                range: 0.."#[test".len(),
+                phantom: PhantomTextLine {
+                    text: smallvec![PhantomText {
+                        kind: PhantomTextKind::Diagnostic,
+                        col: 7,
+                        text: "blah".to_string(),
+                        font_size: None,
+                        fg: None,
+                        bg: None,
+                        under_line: None
+                    }],
+                    max_severity: Some(DiagnosticSeverity::WARNING),
+                }
+            }
+        );
+        assert_eq!(
+            bun.line_info(1),
+            DisplayLineInfo {
+                line: 1,
+                line_shift: 0,
+                range: 0.."hi".len(),
+                phantom: PhantomTextLine::default()
+            }
+        );
+        // aka out of bounds is last line
+        assert_eq!(bun.line_info(2), bun.line_info(1));
+
+        bun.assert_line_cols(&[
+            (0, 0, (0, 0)), // #
+            (0, 1, (0, 1)), // [
+            (0, 2, (0, 2)), // t
+            (0, 3, (0, 3)), // e
+            (0, 4, (0, 4)), // s
+            (0, 5, (0, 5)), // t
+            (0, 6, (0, 6)), // newline
+            (0, 7, (0, 6)), // it has to saturate at newline??
+            (1, 0, (1, 0)), // h
+            (1, 1, (1, 1)), // i
+            (1, 2, (1, 2)), // end
+            (1, 3, (1, 2)), // saturates
+        ]);
+
+        let mut bun = Bundle {
+            buffer: Buffer::new(
+                "        let file_text = toml::to_string(&file).unwrap()",
+            ),
+            phantom_prov: HashMap::new(),
+        };
+        bun.phantom_prov.insert(
+            0,
+            PhantomTextLine {
+                text: smallvec![
+                    PhantomText {
+                        kind: PhantomTextKind::InlayHint,
+                        col: 21,
+                        text: ": String".to_string(),
+                        font_size: Some(13),
+                        fg: Some(Color {
+                            r: 171,
+                            g: 178,
+                            b: 191,
+                            a: 255
+                        }),
+                        bg: Some(Color {
+                            r: 82,
+                            g: 138,
+                            b: 191,
+                            a: 55
+                        }),
+                        under_line: None
+                    },
+                    PhantomText {
+                        kind: PhantomTextKind::Diagnostic,
+                        col: 56,
+                        text: "    Syntax Error: expected SEMICOLON".to_string(),
+                        font_size: Some(13),
+                        fg: Some(Color {
+                            r: 224,
+                            g: 108,
+                            b: 117,
+                            a: 255
+                        }),
+                        bg: None,
+                        under_line: None
+                    }
+                ],
+                max_severity: Some(DiagnosticSeverity::ERROR),
+            },
+        );
+
+        assert_eq!(bun.combined(0), "        let file_text: String = toml::to_string(&file).unwrap()     Syntax Error: expected SEMICOLON ");
+
+        bun.test_display_line_iter(&[(0, 0, 0)]);
+
+        bun.assert_last_line_eq(0);
+
+        assert_eq!(
+            bun.line_info(0),
+            DisplayLineInfo {
+                line: 0,
+                line_shift: 0,
+                range: 0..bun.buffer.len(),
+                phantom: PhantomTextLine {
+                    text: smallvec![
+                        PhantomText {
+                            kind: PhantomTextKind::InlayHint,
+                            col: 21,
+                            text: ": String".to_string(),
+                            font_size: Some(13),
+                            fg: Some(Color {
+                                r: 171,
+                                g: 178,
+                                b: 191,
+                                a: 255
+                            }),
+                            bg: Some(Color {
+                                r: 82,
+                                g: 138,
+                                b: 191,
+                                a: 55
+                            }),
+                            under_line: None
+                        },
+                        PhantomText {
+                            kind: PhantomTextKind::Diagnostic,
+                            col: 56,
+                            text: "    Syntax Error: expected SEMICOLON".to_string(),
+                            font_size: Some(13),
+                            fg: Some(Color {
+                                r: 224,
+                                g: 108,
+                                b: 117,
+                                a: 255
+                            }),
+                            bg: None,
+                            under_line: None
+                        }
+                    ],
+                    max_severity: Some(DiagnosticSeverity::ERROR),
+                }
+            }
+        );
+        // aka out of bounds is last line
+        assert_eq!(bun.line_info(1), bun.line_info(0));
     }
 
     #[test]

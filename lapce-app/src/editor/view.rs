@@ -386,7 +386,9 @@ fn editor_gutter(
                         current_line.get();
                         editor.doc.get()
                     },
-                    move |line: &DocLine| (line.line, current_line.get_untracked()),
+                    move |line: &DocLine| {
+                        (line.display_line, current_line.get_untracked())
+                    },
                     move |cx, line: DocLine| {
                         let line_number = {
                             let config = config.get_untracked();
@@ -395,13 +397,18 @@ fn editor_gutter(
                                 && config.editor.modal_mode_relative_line_numbers
                                 && mode != Mode::Insert
                             {
-                                if line.line == current_line {
-                                    line.line + 1
+                                // TODO: how should relative lines treat these?
+                                if line.real_line == current_line {
+                                    Some(line.real_line + 1)
                                 } else {
-                                    line.line.abs_diff(current_line)
+                                    Some(line.real_line.abs_diff(current_line))
                                 }
+                            } else if line.is_first_display_line {
+                                Some(line.real_line + 1)
                             } else {
-                                line.line + 1
+                                // We only render the line number for the first line in a display
+                                // line
+                                None
                             }
                         };
 
@@ -410,7 +417,12 @@ fn editor_gutter(
                                 label(cx, || "".to_string()).style(cx, move || {
                                     Style::BASE.width_px(padding_left)
                                 }),
-                                label(cx, move || line_number.to_string()).style(
+                                label(cx, move || {
+                                    line_number
+                                        .map(|x| x.to_string())
+                                        .unwrap_or(String::new())
+                                })
+                                .style(
                                     cx,
                                     move || {
                                         let config = config.get();
@@ -419,7 +431,7 @@ fn editor_gutter(
                                         Style::BASE
                                             .flex_grow(1.0)
                                             .apply_if(
-                                                current_line != line.line,
+                                                current_line != line.real_line,
                                                 move |s| {
                                                     s.color(*config.get_color(
                                                         LapceColor::EDITOR_DIM,
@@ -457,9 +469,10 @@ fn editor_gutter(
                                             },
                                         )
                                         .style(cx, move || {
+                                            // TODO: code actions can specify where they appear so they could be on a display line that isn't the first real line!
                                             Style::BASE.apply_if(
                                                 code_action_line.get()
-                                                    != Some(line.line),
+                                                    != Some(line.real_line),
                                                 |s| s.hide(),
                                             )
                                         })
@@ -747,7 +760,7 @@ fn editor_content(cx: AppContext, editor: RwSignal<EditorData>) -> impl View {
                 .with_untracked(|doc| doc.content.clone()),
             line.rev,
             line.style_rev,
-            line.line,
+            line.display_line,
         )
     };
     let view_fn = move |cx, line: DocLine| {

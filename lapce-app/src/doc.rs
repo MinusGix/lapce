@@ -43,7 +43,7 @@ use lsp_types::{
     CodeActionResponse, Diagnostic, DiagnosticSeverity, InlayHint, InlayHintLabel,
 };
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     config::{color::LapceColor, LapceConfig},
@@ -234,7 +234,12 @@ pub struct Document {
 pub struct DocLine {
     pub rev: u64,
     pub style_rev: u64,
-    pub line: usize,
+    /// The actual real line of this display line.  
+    pub real_line: usize,
+    pub display_line: DisplayLine,
+    /// Whether this is the first display line for the real line.  
+    /// If this is false, then we won't render the line number.
+    pub is_first_display_line: bool,
     pub text: Arc<TextLayoutLine>,
     pub code_actions: Option<Arc<(PluginId, CodeActionResponse)>>,
 }
@@ -249,12 +254,19 @@ impl VirtualListVector<DocLine> for Document {
     fn slice(&mut self, range: std::ops::Range<usize>) -> Self::ItemIterator {
         let lines = range
             .into_iter()
-            .map(|line| DocLine {
-                rev: self.buffer.rev(),
-                style_rev: self.style_rev,
-                line,
-                text: self.get_text_layout(DisplayLine::new_unchecked(line), 12),
-                code_actions: self.code_actions.get(&line).cloned(),
+            .map(|line| {
+                let dline = DisplayLine::new_unchecked(line);
+                // TODO: we don't need the phantom text in display line info! Though if we cache this, it does become less of a problem.
+                let line_info = self.display_line_info(dline);
+                DocLine {
+                    rev: self.buffer.rev(),
+                    style_rev: self.style_rev,
+                    real_line: line_info.line,
+                    display_line: dline,
+                    is_first_display_line: line_info.line_shift == 0,
+                    text: self.get_text_layout(dline, 12),
+                    code_actions: self.code_actions.get(&line).cloned(),
+                }
             })
             .collect::<Vec<_>>();
         lines.into_iter()
@@ -919,6 +931,7 @@ impl Document {
     }
 
     pub fn display_line_info(&self, dline: DisplayLine) -> DisplayLineInfo {
+        // TODO: We could cache this
         DisplayLineInfo::new(self, &self.buffer, dline)
     }
 
@@ -1356,9 +1369,7 @@ impl Document {
 
     /// Request inlay hints for the buffer from the LSP through the proxy.
     fn get_inlay_hints(cx: Scope, doc: RwSignal<Document>, proxy: &ProxyRpcHandler) {
-        println!("Get inlay hints");
         if !doc.with_untracked(|doc| doc.loaded) {
-            println!("\tDoc wasn't loaded");
             return;
         }
 
@@ -1372,10 +1383,8 @@ impl Document {
         });
 
         let send = create_ext_action(cx, move |hints| {
-            println!("Got inlay hints, updating doc");
             doc.update(|doc| {
                 if doc.buffer.rev() == rev {
-                    println!("Set inlay hints");
                     doc.inlay_hints = Some(hints);
                     doc.clear_text_layout_cache();
                     doc.clear_phantom_text_cache();
@@ -1409,6 +1418,47 @@ impl Document {
     // be invalidated.
     /// Get the phantom text for a given line.
     fn buffer_line_phantom_text(&self, line: usize) -> Arc<PhantomTextLine> {
+        if line == 132 {
+            return Arc::new(PhantomTextLine {
+                text: smallvec![
+                    PhantomText {
+                        kind: PhantomTextKind::InlayHint,
+                        col: 21,
+                        text: ": String hmm :)".to_string(),
+                        font_size: Some(13),
+                        fg: Some(Color {
+                            r: 171,
+                            g: 178,
+                            b: 191,
+                            a: 255
+                        }),
+                        bg: Some(Color {
+                            r: 82,
+                            g: 138,
+                            b: 191,
+                            a: 55
+                        }),
+                        under_line: None
+                    },
+                    PhantomText {
+                        kind: PhantomTextKind::Diagnostic,
+                        col: 56,
+                        text: "    Syntax Error: expected SEMICOLON\nUnfortunately, semicolons are fake. They should add them in the next update.".to_string(),
+                        font_size: Some(13),
+                        fg: Some(Color {
+                            r: 224,
+                            g: 108,
+                            b: 117,
+                            a: 255
+                        }),
+                        bg: None,
+                        under_line: None
+                    }
+                ],
+                max_severity: Some(DiagnosticSeverity::ERROR),
+            });
+        }
+
         let config = self.config.get_untracked();
 
         // Check if the phantom text needs to update due to the config being changed
@@ -1526,9 +1576,9 @@ impl Document {
                 // let text =
                 //     format!("    {}", diag.diagnostic.message.lines().join(" "));
                 let text = if config.editor.multiline_error_lens {
-                    diag.diagnostic.message.clone()
+                    format!("    {}", diag.diagnostic.message)
                 } else {
-                    diag.diagnostic.message.lines().join(" ")
+                    format!("    {}", diag.diagnostic.message.lines().join(" "))
                 };
                 PhantomText {
                     kind: PhantomTextKind::Diagnostic,
@@ -1542,6 +1592,9 @@ impl Document {
                 }
             });
         let mut diag_text: SmallVec<[PhantomText; 6]> = diag_text.collect();
+        if !diag_text.is_empty() {
+            println!("Diag text on line {line}: {diag_text:?}");
+        }
 
         text.append(&mut diag_text);
 
