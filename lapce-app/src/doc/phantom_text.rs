@@ -174,6 +174,7 @@ impl PhantomTextProvider for std::collections::HashMap<usize, PhantomTextLine> {
     fn phantom_text(&self, line: usize) -> Arc<PhantomTextLine> {
         // We wrap this in an Arc here to make the tests simpler to write, since the tests
         // are cheap.
+
         Arc::new(
             self.get(&line)
                 .cloned()

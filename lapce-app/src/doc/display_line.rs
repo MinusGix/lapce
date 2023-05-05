@@ -1,4 +1,6 @@
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow, cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc,
+};
 
 use lapce_core::{buffer::Buffer, word::WordCursor};
 use smallvec::SmallVec;
@@ -87,18 +89,20 @@ impl DisplayLine {
 
     /// Convert an offset into the relevant (display line, display column).  
     pub fn display_line_col_of_offset(
+        cache: &mut impl DisplayLineCacheLike,
         phantom_prov: &impl PhantomTextProvider,
         buffer: &Buffer,
         offset: usize,
     ) -> (DisplayLine, usize) {
         let (line, col) = buffer.offset_to_line_col(offset);
-        Self::display_line_col_of_line_col(phantom_prov, buffer, line, col)
+        Self::display_line_col_of_line_col(cache, phantom_prov, buffer, line, col)
     }
 
     /// Convert a (line, col) in the buffer into the relevant (display line, display column).  
     /// Note that if you already have a [`DisplayLineInfo`] instance, you should use
     /// [`DisplayLineInfo::col_to_display_col`] instead, as we just call out to that.
     pub fn display_line_col_of_line_col(
+        cache: &mut impl DisplayLineCacheLike,
         phantom_prov: &impl PhantomTextProvider,
         buffer: &Buffer,
         line: usize,
@@ -109,7 +113,7 @@ impl DisplayLine {
             .filter(|(_, _, real_line)| *real_line == line);
         let mut last_dline = None;
         for (dline, _, _) in iter {
-            let info = DisplayLineInfo::new(phantom_prov, buffer, dline);
+            let info = cache.get_init(phantom_prov, buffer, dline);
             let dcol = info.col_to_display_col(col);
 
             last_dline = Some((dline, info));
@@ -126,7 +130,7 @@ impl DisplayLine {
             // Otherwise, we didn't find any display lines at all, so we're probably past the end
             // so we return the last display line and column.
             let last = Self::last_display_line(phantom_prov, buffer);
-            let info = DisplayLineInfo::new(phantom_prov, buffer, last);
+            let info = cache.get_init(phantom_prov, buffer, last);
 
             (last, info.max_display_col())
         }
@@ -200,11 +204,12 @@ impl DisplayLineInfo {
         let mut cur_line_shift = 0;
         let mut start_col: Option<usize> = None;
         let mut end_col: Option<usize> = None;
-        let mut first_col: Option<usize> = None;
 
         let mut new_phantoms: SmallVec<[PhantomText; 6]> = SmallVec::new();
 
-        for (_, size, col, text) in phantom.offset_size_iter() {
+        // for (_, _, col, text) in phantom.offset_size_iter() {
+        for text in phantom.text.iter() {
+            let col = text.col;
             let line_count = text.extra_line_count();
 
             if cur_line_shift > line_shift {
@@ -395,6 +400,130 @@ impl DisplayLineInfo {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct DisplayLineInfoCache {
+    /// The id of the last config, which lets us know when the config changes so we can update
+    /// the cache.
+    config_id: u64,
+    // TODO: Should we use some other cache structure? Like an LruCache? Or a `Vec<Option<T>>` since it will often be completely stored?
+    cache: HashMap<DisplayLine, Rc<DisplayLineInfo>>,
+
+    last_line: Option<DisplayLine>,
+}
+impl DisplayLineInfoCache {
+    pub fn new() -> Self {
+        Self {
+            config_id: 0,
+            cache: HashMap::new(),
+            last_line: None,
+        }
+    }
+
+    pub fn get(&self, dline: DisplayLine) -> Option<Rc<DisplayLineInfo>> {
+        self.cache.get(&dline).cloned()
+    }
+
+    pub fn get_init(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+        dline: DisplayLine,
+    ) -> Rc<DisplayLineInfo> {
+        {
+            if let Some(info) = self.cache.get(&dline) {
+                return info.clone();
+            }
+        }
+
+        let info = Rc::new(DisplayLineInfo::new(phantom_prov, buffer, dline));
+        self.cache.insert(dline, info.clone());
+
+        info
+    }
+
+    /// Get the cached last display line
+    pub fn last_line(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+    ) -> DisplayLine {
+        if let Some(last_line) = self.last_line {
+            return last_line;
+        }
+
+        let last_line = DisplayLine::last_display_line(phantom_prov, buffer);
+        self.last_line = Some(last_line);
+        last_line
+    }
+
+    /// Clear the entire cache. You should prefer using more specific methods.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Clear the cache for a specific line.
+    pub fn clear_line(&mut self, dline: DisplayLine) {
+        self.cache.remove(&dline);
+    }
+
+    /// Clear `start_line..=last_line` line caches.
+    pub fn clear_lines(&mut self, start_line: DisplayLine, last_line: DisplayLine) {
+        for dline in start_line.get()..=last_line.get() {
+            self.cache.remove(&DisplayLine::new_unchecked(dline));
+        }
+    }
+
+    pub fn check_attributes(&mut self, config_id: u64) {
+        if self.config_id != config_id {
+            self.clear();
+            self.config_id = config_id;
+        }
+    }
+}
+
+pub trait DisplayLineCacheLike {
+    fn get_init(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+        dline: DisplayLine,
+    ) -> Rc<DisplayLineInfo>;
+}
+
+impl DisplayLineCacheLike for DisplayLineInfoCache {
+    fn get_init(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+        dline: DisplayLine,
+    ) -> Rc<DisplayLineInfo> {
+        DisplayLineInfoCache::get_init(self, phantom_prov, buffer, dline)
+    }
+}
+impl<'a> DisplayLineCacheLike for &'a mut DisplayLineInfoCache {
+    fn get_init(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+        dline: DisplayLine,
+    ) -> Rc<DisplayLineInfo> {
+        DisplayLineInfoCache::get_init(self, phantom_prov, buffer, dline)
+    }
+}
+
+// Aka "no cache". For testing without having to setup the cache at all.
+#[cfg(test)]
+impl DisplayLineCacheLike for () {
+    fn get_init(
+        &mut self,
+        phantom_prov: &impl PhantomTextProvider,
+        buffer: &Buffer,
+        dline: DisplayLine,
+    ) -> Rc<DisplayLineInfo> {
+        Rc::new(DisplayLineInfo::new(phantom_prov, buffer, dline))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -460,6 +589,7 @@ mod tests {
         ) {
             assert_eq!(
                 DisplayLine::display_line_col_of_line_col(
+                    &mut (), // no cache
                     &self.phantom_prov,
                     &self.buffer,
                     line,

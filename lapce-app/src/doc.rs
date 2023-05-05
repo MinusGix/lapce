@@ -1,5 +1,5 @@
 use std::{
-    borrow::Cow, cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc,
+    cell::RefCell, collections::HashMap, ops::Range, path::PathBuf, rc::Rc,
     sync::Arc,
 };
 
@@ -51,7 +51,7 @@ use crate::{
 };
 
 use self::{
-    display_line::{DisplayLine, DisplayLineInfo},
+    display_line::{DisplayLine, DisplayLineInfo, DisplayLineInfoCache},
     phantom_text::{
         PhantomText, PhantomTextKind, PhantomTextLine, PhantomTextProvider,
     },
@@ -135,6 +135,15 @@ impl TextLayoutCache {
         self.layouts.clear();
     }
 
+    /// Clears the cache for `start_line..=last_line`
+    fn clear_lines(&mut self, start_line: DisplayLine, last_line: DisplayLine) {
+        for (_, layouts) in self.layouts.iter_mut() {
+            for line in start_line.get()..=last_line.get() {
+                layouts.remove(&DisplayLine::new_unchecked(line));
+            }
+        }
+    }
+
     pub fn check_attributes(&mut self, config_id: u64) {
         if self.config_id != config_id {
             self.clear();
@@ -164,6 +173,12 @@ impl PhantomTextCache {
 
     fn clear(&mut self) {
         self.phantom_text.clear();
+    }
+
+    fn clear_real_lines(&mut self, start_line: usize, last_line: usize) {
+        for line in start_line..=last_line {
+            self.phantom_text.remove(&line);
+        }
     }
 
     pub fn check_attributes(&mut self, config_id: u64) {
@@ -227,6 +242,7 @@ pub struct Document {
     /// since we may need to fill it with constructed text layouts.
     pub text_layouts: Rc<RefCell<TextLayoutCache>>,
     phantom_text: Rc<RefCell<PhantomTextCache>>,
+    display_line_info: Rc<RefCell<DisplayLineInfoCache>>,
     proxy: ProxyRpcHandler,
     config: ReadSignal<Arc<LapceConfig>>,
 }
@@ -295,6 +311,7 @@ impl Document {
             loaded: false,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             phantom_text: Rc::new(RefCell::new(PhantomTextCache::new())),
+            display_line_info: Rc::new(RefCell::new(DisplayLineInfoCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
             config,
@@ -322,6 +339,7 @@ impl Document {
             loaded: true,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             phantom_text: Rc::new(RefCell::new(PhantomTextCache::new())),
+            display_line_info: Rc::new(RefCell::new(DisplayLineInfoCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
             config,
@@ -347,7 +365,7 @@ impl Document {
         self.buffer.detect_indent(self.syntax.as_ref());
         self.loaded = true;
         self.on_update(None);
-        self.init_diagnostics();
+        self.init_diagnostics(im::Vector::default());
     }
 
     /// Reload the document's content, and is what you should typically use when you want to *set*
@@ -424,6 +442,7 @@ impl Document {
             self.update_styles(delta);
             self.update_inlay_hints(delta);
             self.update_diagnostics(delta);
+            self.update_display_line_info(delta);
             // self.update_completion(delta);
             if let DocContent::File(path) = &self.content {
                 self.proxy
@@ -479,6 +498,18 @@ impl Document {
         }
     }
 
+    // TODO: ?
+    // fn update_display_line_info(&mut self, delta: &RopeDelta) {
+    //     for region in delta.iter_inserts() {
+    //         let old_offset = region.old_offset;
+    //         let new_offset = region.new_offset;
+
+    //         let start_dline = self.display_line_of_offset(old_offset);
+    //         let end_dline = self.display_line_of_offset(new_offset);
+
+    //     }
+    // }
+
     fn trigger_syntax_change(&mut self, edits: Option<SmallVec<[SyntaxEdit; 3]>>) {
         let Some(syntax) = self.syntax.as_mut() else { return };
 
@@ -494,6 +525,7 @@ impl Document {
     }
 
     fn clear_text_layout_cache(&mut self) {
+        println!("== Clear text layout cache ==");
         self.text_layouts.borrow_mut().clear();
         self.style_rev += 1;
     }
@@ -504,8 +536,66 @@ impl Document {
         self.phantom_text.borrow_mut().clear();
     }
 
+    fn clear_display_line_info_cache(&mut self) {
+        self.display_line_info.borrow_mut().clear();
+    }
+
     fn clear_code_actions(&mut self) {
         self.code_actions.clear();
+    }
+
+    /// Clear the caches for lines that would be affected by the change in inlay hints.  
+    /// This should be called *before* the actual change.
+    fn clear_cache_for_inlay_hints(
+        &mut self,
+        new_inlay_hints: Option<&Spans<InlayHint>>,
+    ) {
+        // We just mark any line that had inlay hints previously, or gained inlay hints, as needing
+        // to be reacquired. There's some smarter stuff that you could do since ~most inlay hints
+        // aren't changed.
+        // (Though, how expensive it would be to check that they're the same inlay hints is
+        // a question.)
+
+        // if let Some(old_inlay_hints) = new_inlay_hints {
+        //     for (iv, _) in old_inlay_hints.iter() {
+        //         let start_dline = self.display_line_of_offset(iv.start);
+        //         let last_dline = self.display_line_of_offset(iv.end);
+        //         let start_line = self.buffer.line_of_offset(iv.start);
+        //         let last_line = self.buffer.line_of_offset(iv.end);
+        //         clear_cache_lines(
+        //             &mut *self.text_layouts.borrow_mut(),
+        //             &mut *self.phantom_text.borrow_mut(),
+        //             &mut *self.display_line_info.borrow_mut(),
+        //             start_dline,
+        //             last_dline,
+        //             start_line,
+        //             last_line,
+        //         );
+        //     }
+        // }
+
+        // if let Some(inlay_hints) = &self.inlay_hints {
+        //     for (iv, _) in inlay_hints.iter() {
+        //         let start_dline = self.display_line_of_offset(iv.start);
+        //         let last_dline = self.display_line_of_offset(iv.end);
+        //         let start_line = self.buffer.line_of_offset(iv.start);
+        //         let last_line = self.buffer.line_of_offset(iv.end);
+
+        //         clear_cache_lines(
+        //             &mut *self.text_layouts.borrow_mut(),
+        //             &mut *self.phantom_text.borrow_mut(),
+        //             &mut *self.display_line_info.borrow_mut(),
+        //             start_dline,
+        //             last_dline,
+        //             start_line,
+        //             last_line,
+        //         );
+        //     }
+        // }
+
+        self.clear_text_layout_cache();
+        self.clear_phantom_text_cache();
+        self.clear_display_line_info_cache();
     }
 
     /// Get the display column for the [`ColPosition`]
@@ -930,13 +1020,26 @@ impl Document {
         }
     }
 
-    pub fn display_line_info(&self, dline: DisplayLine) -> DisplayLineInfo {
-        // TODO: We could cache this
-        DisplayLineInfo::new(self, &self.buffer, dline)
+    pub fn display_line_info(&self, dline: DisplayLine) -> Rc<DisplayLineInfo> {
+        let config = self.config.get_untracked();
+
+        self.display_line_info
+            .borrow_mut()
+            .check_attributes(config.id);
+
+        self.display_line_info
+            .borrow_mut()
+            .get_init(self, &self.buffer, dline)
     }
 
     pub fn display_line_of_offset(&self, offset: usize) -> DisplayLine {
-        DisplayLine::display_line_col_of_offset(self, &self.buffer, offset).0
+        DisplayLine::display_line_col_of_offset(
+            &mut *self.display_line_info.borrow_mut(),
+            self,
+            &self.buffer,
+            offset,
+        )
+        .0
     }
 
     /// Convert a (line, col) in the buffer into the relevant (display line, display column).
@@ -945,11 +1048,22 @@ impl Document {
         line: usize,
         col: usize,
     ) -> (DisplayLine, usize) {
-        DisplayLine::display_line_col_of_line_col(self, &self.buffer, line, col)
+        DisplayLine::display_line_col_of_line_col(
+            &mut *self.display_line_info.borrow_mut(),
+            self,
+            &self.buffer,
+            line,
+            col,
+        )
     }
 
     pub fn display_line_col_of_offset(&self, offset: usize) -> (DisplayLine, usize) {
-        DisplayLine::display_line_col_of_offset(self, &self.buffer, offset)
+        DisplayLine::display_line_col_of_offset(
+            &mut *self.display_line_info.borrow_mut(),
+            self,
+            &self.buffer,
+            offset,
+        )
     }
 
     // TODO: cache this calculation. We can just update it in on_update or whatever
@@ -1385,9 +1499,11 @@ impl Document {
         let send = create_ext_action(cx, move |hints| {
             doc.update(|doc| {
                 if doc.buffer.rev() == rev {
+                    doc.clear_cache_for_inlay_hints(Some(&hints));
                     doc.inlay_hints = Some(hints);
-                    doc.clear_text_layout_cache();
-                    doc.clear_phantom_text_cache();
+                    // doc.clear_text_layout_cache();
+                    // doc.clear_phantom_text_cache();
+                    // doc.clear_display_line_info_cache();
                 }
             })
         });
@@ -1686,10 +1802,16 @@ impl Document {
         });
     }
 
+    // TODO: It'd be nice if we could unify the inlay hints / init diagnostics to take either the
+    // old versions or the new versions, rather than doing a different thing for each.
     /// init diagnostics offset ranges from lsp positions
-    pub fn init_diagnostics(&mut self) {
+    pub fn init_diagnostics(
+        &mut self,
+        old_diagnostics: im::Vector<EditorDiagnostic>,
+    ) {
         self.clear_text_layout_cache();
         self.clear_phantom_text_cache();
+        self.clear_display_line_info_cache();
         self.clear_code_actions();
         self.diagnostics.diagnostics.update(|diagnostics| {
             for diagnostic in diagnostics.iter_mut() {
@@ -1702,6 +1824,45 @@ impl Document {
                 diagnostic.range = (start, end);
             }
         });
+
+        // // Clear the cache that intersects the diagnostics
+        // for diag in old_diagnostics.iter() {
+        //     let (start_offset, end_offset) = diag.range;
+        //     let start_dline = self.display_line_of_offset(start_offset);
+        //     // TODO: do we need to sub one to make the range exclusive?
+        //     let end_dline = self.display_line_of_offset(end_offset);
+        //     let start_line = self.buffer.line_of_offset(start_offset);
+        //     let end_line = self.buffer.line_of_offset(end_offset);
+
+        //     clear_cache_lines(
+        //         &mut *self.text_layouts.borrow_mut(),
+        //         &mut *self.phantom_text.borrow_mut(),
+        //         &mut *self.display_line_info.borrow_mut(),
+        //         start_dline,
+        //         end_dline,
+        //         start_line,
+        //         end_line,
+        //     );
+        // }
+
+        // for diag in self.diagnostics.diagnostics.get_untracked() {
+        //     let (start_offset, end_offset) = diag.range;
+        //     let start_dline = self.display_line_of_offset(start_offset);
+        //     // TODO: do we need to sub one to make the range exclusive?
+        //     let end_dline = self.display_line_of_offset(end_offset);
+        //     let start_line = self.buffer.line_of_offset(start_offset);
+        //     let end_line = self.buffer.line_of_offset(end_offset);
+
+        //     clear_cache_lines(
+        //         &mut *self.text_layouts.borrow_mut(),
+        //         &mut *self.phantom_text.borrow_mut(),
+        //         &mut *self.display_line_info.borrow_mut(),
+        //         start_dline,
+        //         end_dline,
+        //         start_line,
+        //         end_line,
+        //     );
+        // }
     }
 }
 
@@ -1713,4 +1874,19 @@ impl PhantomTextProvider for Document {
         // line calculation bits for display line.
         self.buffer_line_phantom_text(line)
     }
+}
+
+fn clear_cache_lines(
+    text_layouts: &mut TextLayoutCache,
+    phantom_text: &mut PhantomTextCache,
+    display_line_info: &mut DisplayLineInfoCache,
+    start_dline: DisplayLine,
+    last_dline: DisplayLine,
+    start_line: usize,
+    last_line: usize,
+) {
+    println!(" - - Clearing {start_line}..={last_line} cache lines");
+    text_layouts.clear_lines(start_dline, last_dline);
+    phantom_text.clear_real_lines(start_line, last_line);
+    display_line_info.clear_lines(start_dline, last_dline);
 }

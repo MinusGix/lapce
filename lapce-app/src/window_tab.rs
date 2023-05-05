@@ -728,10 +728,9 @@ impl WindowTabData {
                     .sorted_by_key(|d| d.diagnostic.range.start)
                     .collect();
 
-                self.main_split
-                    .get_diagnostic_data(&path)
-                    .diagnostics
-                    .set(diagnostics);
+                let diag_data = self.main_split.get_diagnostic_data(&path);
+                let old_diagnostics = diag_data.diagnostics.get_untracked().clone();
+                diag_data.diagnostics.set(diagnostics);
 
                 // inform the document about the diagnostics
                 if let Some(doc) = self
@@ -739,7 +738,7 @@ impl WindowTabData {
                     .docs
                     .with_untracked(|docs| docs.get(&path).cloned())
                 {
-                    doc.update(|doc| doc.init_diagnostics());
+                    doc.update(|doc| doc.init_diagnostics(old_diagnostics));
                 }
             }
             CoreNotification::TerminalProcessStopped { term_id } => {
