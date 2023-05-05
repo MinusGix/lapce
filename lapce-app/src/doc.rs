@@ -49,6 +49,7 @@ use crate::{
 
 use self::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};
 
+pub mod display_line;
 mod phantom_text;
 
 pub struct SystemClipboard {}
