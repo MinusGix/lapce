@@ -47,10 +47,15 @@ use crate::{
     workspace::LapceWorkspace,
 };
 
-use self::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};
+use self::{
+    display_line::{Lines, WrapWidth},
+    phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
+    width_calc::BasicWidthCalc,
+};
 
 pub mod display_line;
 mod phantom_text;
+mod width_calc;
 
 pub struct SystemClipboard {}
 
@@ -183,6 +188,8 @@ pub struct Document {
     /// Whether the buffer's content has been loaded/initialized into the buffer.
     loaded: bool,
 
+    lines: Lines,
+
     /// The ready-to-render text layouts for the document.  
     /// This is an `Rc<RefCell<_>>` due to needing to access it even when the document is borrowed,
     /// since we may need to fill it with constructed text layouts.
@@ -241,6 +248,7 @@ impl Document {
             diagnostics,
             content: DocContent::File(path),
             loaded: false,
+            lines: Lines::default(),
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -267,6 +275,7 @@ impl Document {
                 diagnostics: create_rw_signal(cx, im::Vector::new()),
             },
             loaded: true,
+            lines: Lines::default(),
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -294,6 +303,8 @@ impl Document {
         self.loaded = true;
         self.on_update(None);
         self.init_diagnostics();
+        self.lines
+            .set_wrap_width(self.buffer.text(), WrapWidth::Bytes(30));
     }
 
     /// Reload the document's content, and is what you should typically use when you want to *set*
@@ -301,8 +312,9 @@ impl Document {
     pub fn reload(&mut self, content: Rope, set_pristine: bool) {
         // self.code_actions.clear();
         // self.inlay_hints = None;
+        let prev_text = self.buffer.text().clone();
         let delta = self.buffer.reload(content, set_pristine);
-        self.apply_deltas(&[delta]);
+        self.apply_deltas(&prev_text, &[delta]);
     }
 
     pub fn do_insert(
@@ -311,6 +323,7 @@ impl Document {
         s: &str,
         config: &LapceConfig,
     ) -> Vec<(RopeDelta, InvalLines, SyntaxEdit)> {
+        let prev_text = self.buffer.text().clone();
         let old_cursor = cursor.mode.clone();
         let deltas = Editor::insert(
             cursor,
@@ -322,7 +335,7 @@ impl Document {
         // Keep track of the change in the cursor mode for undo/redo
         self.buffer.set_cursor_before(old_cursor);
         self.buffer.set_cursor_after(cursor.mode.clone());
-        self.apply_deltas(&deltas);
+        self.apply_deltas(&prev_text, &deltas);
         deltas
     }
 
@@ -331,8 +344,12 @@ impl Document {
         edits: &[(impl AsRef<Selection>, &str)],
         edit_type: EditType,
     ) -> (RopeDelta, InvalLines, SyntaxEdit) {
+        let prev_text = self.buffer.text().clone();
         let (delta, inval_lines, edits) = self.buffer.edit(edits, edit_type);
-        self.apply_deltas(&[(delta.clone(), inval_lines.clone(), edits.clone())]);
+        self.apply_deltas(
+            &prev_text,
+            &[(delta.clone(), inval_lines.clone(), edits.clone())],
+        );
         (delta, inval_lines, edits)
     }
 
@@ -345,6 +362,7 @@ impl Document {
     ) -> Vec<(RopeDelta, InvalLines, SyntaxEdit)> {
         let mut clipboard = SystemClipboard {};
         let old_cursor = cursor.mode.clone();
+        let prev_text = self.buffer.text().clone();
         let deltas = Editor::do_edit(
             cursor,
             &mut self.buffer,
@@ -360,16 +378,35 @@ impl Document {
             self.buffer.set_cursor_after(cursor.mode.clone());
         }
 
-        self.apply_deltas(&deltas);
+        self.apply_deltas(&prev_text, &deltas);
         deltas
     }
 
-    fn apply_deltas(&mut self, deltas: &[(RopeDelta, InvalLines, SyntaxEdit)]) {
+    fn apply_deltas(
+        &mut self,
+        prev_text: &Rope,
+        deltas: &[(RopeDelta, InvalLines, SyntaxEdit)],
+    ) {
         let rev = self.rev() - deltas.len() as u64;
+        let mut width_calc = {
+            let config = self.config.get_untracked();
+            let family: SmallVec<[FamilyOwned; 3]> =
+                FamilyOwned::parse_list(&config.editor.font_family).collect();
+            let font_size = config.editor.font_size as f32;
+            BasicWidthCalc::new(family, font_size)
+        };
+
         for (i, (delta, _, _)) in deltas.iter().enumerate() {
             self.update_styles(delta);
             self.update_inlay_hints(delta);
             self.update_diagnostics(delta);
+            self.lines.after_edit(
+                self.buffer.text(),
+                prev_text,
+                delta,
+                &mut width_calc,
+                0..1000,
+            );
             // self.update_completion(delta);
             if let DocContent::File(path) = &self.content {
                 self.proxy
@@ -779,6 +816,7 @@ impl Document {
     ) {
         match cursor.mode {
             CursorMode::Normal(offset) => {
+                let prev_text = self.buffer.text().clone();
                 let (new_offset, horiz) = self.move_offset(
                     offset,
                     cursor.horiz.as_ref(),
@@ -816,7 +854,7 @@ impl Document {
                         movement.is_vertical(),
                         register,
                     );
-                    self.apply_deltas(&deltas);
+                    self.apply_deltas(&prev_text, &deltas);
                     cursor.motion_mode = None;
                 } else {
                     cursor.mode = CursorMode::Normal(new_offset);

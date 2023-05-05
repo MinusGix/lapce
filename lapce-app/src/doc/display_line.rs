@@ -5,15 +5,18 @@
 
 // This is based on xi-editor's line-wrap logic
 
-use std::{cmp::Ordering, ops::Range};
+use std::{borrow::Cow, cmp::Ordering, ops::Range};
 
 use lapce_core::buffer::InvalLines;
 use lapce_xi_rope::{
     breaks::{BreakBuilder, Breaks, BreaksInfo, BreaksMetric},
     Cursor, Interval, LinesMetric, Rope, RopeDelta, RopeInfo,
 };
+use xi_unicode::LineBreakLeafIter;
 
-pub trait WidthCalc {}
+use crate::doc::width_calc::ByteWidthCalc;
+
+use super::width_calc::WidthCalc;
 
 /// The visual width of the buffer for the purpose of word wrapping.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,15 +52,23 @@ impl WrapWidth {
     }
 }
 
-pub struct VisualLine {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct VisualLine(usize);
+impl VisualLine {
+    pub fn get(&self) -> usize {
+        self.0
+    }
+}
+
+pub struct VisualLineEntry {
     pub interval: Interval,
     /// The buffer line number for this line. This is only set for the first visual line of a
     /// buffer line.
     pub line: Option<usize>,
 }
-impl VisualLine {
+impl VisualLineEntry {
     fn new<I: Into<Interval>, L: Into<Option<usize>>>(iv: I, line: L) -> Self {
-        VisualLine {
+        VisualLineEntry {
             interval: iv.into(),
             line: line.into(),
         }
@@ -83,11 +94,12 @@ struct WrapSummary {
 type Task = Interval;
 
 /// Tracks state related to visual lines.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Lines {
     /// Tracks linebreak information
     breaks: Breaks,
     wrap: WrapWidth,
+    // TODO: Document relies on being relatively cheap to clone
     /// Ranges of lines that need be wrapped.
     work: Vec<Task>,
 }
@@ -164,8 +176,19 @@ impl Lines {
         line
     }
 
-    pub fn offset_of_visual_line(&self, text: &Rope, line: usize) -> usize {
-        todo!()
+    pub fn offset_of_visual_line(&self, text: &Rope, line: VisualLine) -> usize {
+        let line = line.get();
+        match self.wrap {
+            WrapWidth::None => {
+                // sanitize input
+                let line = line.min(text.measure::<LinesMetric>() + 1);
+                text.offset_of_line(line)
+            }
+            _ => {
+                let mut cursor = MergedBreaks::new(text, &self.breaks);
+                cursor.offset_of_line(line)
+            }
+        }
     }
 
     /// Iterator over [`VisualLine`]s, starting at `start_line`
@@ -173,9 +196,18 @@ impl Lines {
         &'a self,
         text: &'a Rope,
         start_line: usize,
-    ) -> impl Iterator<Item = VisualLine> + 'a {
-        todo!();
-        std::iter::empty() // silence err
+    ) -> impl Iterator<Item = VisualLineEntry> + 'a {
+        let mut cursor = MergedBreaks::new(text, &self.breaks);
+        let offset = cursor.offset_of_line(start_line);
+        let logical_line = text.line_of_offset(offset) + 1;
+        cursor.set_offset(offset);
+        VisualLines {
+            offset,
+            cursor,
+            len: text.len(),
+            logical_line,
+            eof: false,
+        }
     }
 
     /// Returns the next task, prioritizing the currently visible region.  
@@ -376,14 +408,9 @@ impl Lines {
             "task_start must be valid offset"
         );
 
+        let mut bcalc = ByteWidthCalc;
         let mut ctx = match self.wrap {
-            Bytes(b) => RewrapCtx::new(
-                text,
-                &CodepointMono,
-                b as f64,
-                width_cache,
-                task.start,
-            ),
+            Bytes(b) => RewrapCtx::new(text, b as f64, &mut bcalc, task.start),
             Width(w) => RewrapCtx::new(text, w, width_cache, task.start),
             None => unreachable!(),
         };
@@ -478,11 +505,11 @@ impl Lines {
 /// A potential opportunity to insert a break. In this representation, the widths
 /// have been requested (in a batch request) but are not necessarily known until
 /// the request is issued.
-struct PotentialBreak {
+struct PotentialBreak<'a> {
     /// The offset within the text of the end of the word.
     pos: usize,
-    /// A token referencing the width of the word, to be resolved in the width cache.
-    tok: Token,
+    /// A word to be resolved in the width calc
+    word: Cow<'a, str>,
     /// Whether the break is a hard break or a soft break.
     hard: bool,
 }
@@ -493,7 +520,7 @@ struct RewrapCtx<'a> {
     lb_cursor: LineBreakCursor<'a>,
     lb_cursor_pos: usize,
     width_cache: &'a mut dyn WidthCalc,
-    pot_breaks: Vec<PotentialBreak>,
+    pot_breaks: Vec<PotentialBreak<'a>>,
     /// Index within `pot_breaks`
     pot_break_ix: usize,
     max_width: f64,
@@ -530,9 +557,9 @@ impl<'a> RewrapCtx<'a> {
         while pos < self.text.len() && self.pot_breaks.len() < MAX_POT_BREAKS {
             let (next, hard) = self.lb_cursor.next();
             let word = self.text.slice_to_cow(pos..next);
-            let tok = req.request(N_RESERVED_STYLES, &word);
+            // let tok = req.request(N_RESERVED_STYLES, &word);
             pos = next;
-            self.pot_breaks.push(PotentialBreak { pos, tok, hard });
+            self.pot_breaks.push(PotentialBreak { pos, word, hard });
         }
         self.lb_cursor_pos = pos;
     }
@@ -548,7 +575,8 @@ impl<'a> RewrapCtx<'a> {
                 self.refill_pot_breaks();
             }
             let pot_break = &self.pot_breaks[self.pot_break_ix];
-            let width = self.width_cache.resolve(pot_break.tok);
+            // let width = self.width_cache.resolve(pot_break.tok);
+            let width = self.width_cache.measure_width(&pot_break.word);
             if !pot_break.hard {
                 if line_width == 0.0 && width >= self.max_width {
                     // we don't care about soft breaks at EOF
@@ -629,9 +657,9 @@ struct VisualLines<'a> {
 }
 
 impl<'a> Iterator for VisualLines<'a> {
-    type Item = VisualLine;
+    type Item = VisualLineEntry;
 
-    fn next(&mut self) -> Option<VisualLine> {
+    fn next(&mut self) -> Option<VisualLineEntry> {
         let line_num = if self.cursor.is_hard_break() {
             Some(self.logical_line)
         } else {
@@ -645,7 +673,7 @@ impl<'a> Iterator for VisualLines<'a> {
                 self.len
             }
         };
-        let result = VisualLine::new(self.offset..next_end_bound, line_num);
+        let result = VisualLineEntry::new(self.offset..next_end_bound, line_num);
         if self.cursor.is_hard_break() {
             self.logical_line += 1;
         }
