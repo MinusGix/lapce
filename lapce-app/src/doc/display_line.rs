@@ -53,7 +53,7 @@ impl WrapWidth {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct VisualLine(usize);
+pub struct VisualLine(pub usize);
 impl VisualLine {
     pub fn get(&self) -> usize {
         self.0
@@ -112,6 +112,7 @@ impl Lines {
             // we keep breaks while resizing, for more efficient invalidation
             self.breaks = Breaks::new_no_break(text.len());
         }
+        self.wrap = wrap;
     }
 
     /// Add an interval to be (re)wrapped, merging it with existing work.
@@ -168,20 +169,19 @@ impl Lines {
         self.work.iter().any(|t| !t.intersect(iv).is_empty())
     }
 
-    pub fn visual_line_of_offset(&self, text: &Rope, offset: usize) -> usize {
+    pub fn visual_line_of_offset(&self, text: &Rope, offset: usize) -> VisualLine {
         let mut line = text.line_of_offset(offset);
         if self.wrap != WrapWidth::None {
             line += self.breaks.count::<BreaksMetric>(offset);
         }
-        line
+        VisualLine(line)
     }
 
     pub fn offset_of_visual_line(&self, text: &Rope, line: VisualLine) -> usize {
-        let line = line.get();
         match self.wrap {
             WrapWidth::None => {
-                // sanitize input
-                let line = line.min(text.measure::<LinesMetric>() + 1);
+                // Ensure that it does not exceed the rope line count
+                let line = line.get().min(text.measure::<LinesMetric>() + 1);
                 text.offset_of_line(line)
             }
             _ => {
@@ -195,7 +195,7 @@ impl Lines {
     pub fn iter_lines<'a>(
         &'a self,
         text: &'a Rope,
-        start_line: usize,
+        start_line: VisualLine,
     ) -> impl Iterator<Item = VisualLineEntry> + 'a {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(start_line);
@@ -294,7 +294,7 @@ impl Lines {
         &mut self,
         text: &Rope,
         width_cache: &mut impl WidthCalc,
-        visible_lines: Range<usize>,
+        visible_lines: Range<VisualLine>,
     ) -> Option<InvalLines> {
         if self.is_converged() {
             None
@@ -322,7 +322,7 @@ impl Lines {
         old_text: &Rope,
         delta: &RopeDelta,
         width_cache: &mut impl WidthCalc,
-        visible_lines: Range<usize>,
+        visible_lines: Range<VisualLine>,
     ) -> Option<InvalLines> {
         let (iv, newlen) = delta.summary();
 
@@ -389,7 +389,7 @@ impl Lines {
         &mut self,
         text: &Rope,
         width_cache: &mut impl WidthCalc,
-        visible_lines: Range<usize>,
+        visible_lines: Range<VisualLine>,
         max_lines: Option<usize>,
     ) -> WrapSummary {
         use self::WrapWidth::*;
@@ -418,7 +418,8 @@ impl Lines {
         let start_line = cursor.cur_line;
         let max_lines = max_lines.unwrap_or(MAX_LINES_PER_BATCH);
         // always wrap at least a screen worth of lines (unless we converge earlier)
-        let batch_size = max_lines.max(visible_lines.end - visible_lines.start);
+        let batch_size =
+            max_lines.max(visible_lines.end.get() - visible_lines.start.get());
 
         let mut builder = BreakBuilder::new();
         let mut lines_wrapped = 0;
@@ -478,7 +479,11 @@ impl Lines {
         }
     }
 
-    pub fn logical_line_range(&self, text: &Rope, line: usize) -> (usize, usize) {
+    pub fn logical_line_range(
+        &self,
+        text: &Rope,
+        line: VisualLine,
+    ) -> (usize, usize) {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(line);
         let logical_line = text.line_of_offset(offset);
@@ -497,7 +502,12 @@ impl Lines {
     #[cfg(test)]
     fn rewrap_all(&mut self, text: &Rope, width_cache: &mut impl WidthCalc) {
         if !self.is_converged() {
-            self.do_wrap_task(text, width_cache, 0..10, Some(usize::max_value()));
+            self.do_wrap_task(
+                text,
+                width_cache,
+                VisualLine(0)..VisualLine(10),
+                Some(usize::max_value()),
+            );
         }
     }
 }
@@ -575,7 +585,6 @@ impl<'a> RewrapCtx<'a> {
                 self.refill_pot_breaks();
             }
             let pot_break = &self.pot_breaks[self.pot_break_ix];
-            // let width = self.width_cache.resolve(pot_break.tok);
             let width = self.width_cache.measure_width(&pot_break.word);
             if !pot_break.hard {
                 if line_width == 0.0 && width >= self.max_width {
@@ -781,8 +790,8 @@ impl<'a> MergedBreaks<'a> {
             merged_line_of_offset(self.text.root(), self.soft.root(), self.offset);
     }
 
-    fn offset_of_line(&mut self, line: usize) -> usize {
-        match line {
+    fn offset_of_line(&mut self, line: VisualLine) -> usize {
+        match line.get() {
             0 => 0,
             l if l >= self.total_lines => self.text.total_len(),
             l if l == self.cur_line => self.offset,
@@ -838,11 +847,19 @@ fn merged_line_of_offset(text: &Rope, soft: &Breaks, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::{borrow::Cow, ops::Range};
+
     use lapce_xi_rope::{
-        breaks::{BreakBuilder, BreaksInfo, BreaksMetric},
+        breaks::{BreakBuilder, Breaks, BreaksInfo, BreaksMetric},
         tree::Node,
-        Cursor,
+        Cursor, Interval, LinesMetric, Rope,
     };
+
+    use crate::doc::{
+        display_line::merged_line_of_offset, width_calc::ByteWidthCalc,
+    };
+
+    use super::{Lines, MergedBreaks, VisualLine, WrapWidth};
 
     #[test]
     fn breaks_multiple() {
@@ -863,5 +880,475 @@ mod tests {
         assert_eq!(c.next::<BreaksMetric>().unwrap(), 5);
         // because there's no next boundary, even though there's three entries at this boundary
         assert!(c.next::<BreaksMetric>().is_none());
+    }
+
+    fn make_lines(text: &Rope, width: f64) -> Lines {
+        let mut width_calc = ByteWidthCalc;
+        let wrap = WrapWidth::Bytes(width as usize);
+        let mut lines = Lines::for_testing(text, wrap);
+        lines.rewrap_all(text, &mut width_calc);
+        assert!(lines.is_converged());
+        lines
+    }
+
+    fn render_breaks<'a>(text: &'a Rope, lines: &Lines) -> Vec<Cow<'a, str>> {
+        let result = lines
+            .iter_lines(text, VisualLine(0))
+            .map(|l| text.slice_to_cow(l.interval))
+            .collect();
+        result
+    }
+
+    fn debug_breaks(text: &Rope, width: f64) -> Vec<Cow<'_, str>> {
+        let lines = make_lines(text, width);
+        render_breaks(text, &lines)
+    }
+
+    #[test]
+    fn column_breaks_basic() {
+        let text: Rope = "every wordthing should getits own".into();
+        let result = debug_breaks(&text, 8.0);
+        assert_eq!(
+            result,
+            vec!["every ", "wordthing ", "should ", "getits ", "own",]
+        );
+    }
+
+    #[test]
+    fn column_breaks_trailing_newline() {
+        let text: Rope = "every wordthing should getits ow\n".into();
+        let result = debug_breaks(&text, 8.0);
+        assert_eq!(
+            result,
+            vec!["every ", "wordthing ", "should ", "getits ", "ow\n", "",]
+        );
+    }
+
+    #[test]
+    fn soft_before_hard() {
+        let text: Rope =
+            "create abreak between THESE TWO\nwords andbreakcorrectlyhere\nplz"
+                .into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(
+            result,
+            vec![
+                "create ",
+                "abreak ",
+                "between ",
+                "THESE ",
+                "TWO\n",
+                "words ",
+                "andbreakcorrectlyhere\n",
+                "plz",
+            ]
+        );
+    }
+
+    #[test]
+    fn column_breaks_hard_soft() {
+        let text: Rope = "so\nevery wordthing should getits own".into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(
+            result,
+            vec!["so\n", "every ", "wordthing ", "should ", "getits ", "own",]
+        );
+    }
+
+    #[test]
+    fn empty_file() {
+        let text: Rope = "".into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn dont_break_til_i_tell_you() {
+        let text: Rope = "thisis_longerthan_our_break_width".into();
+        let result = debug_breaks(&text, 12.0);
+        assert_eq!(result, vec!["thisis_longerthan_our_break_width"]);
+    }
+
+    #[test]
+    fn break_now_though() {
+        let text: Rope = "thisis_longerthan_our_break_width hi".into();
+        let result = debug_breaks(&text, 12.0);
+        assert_eq!(result, vec!["thisis_longerthan_our_break_width ", "hi"]);
+    }
+
+    #[test]
+    fn newlines() {
+        let text: Rope = "\n\n".into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(result, vec!["\n", "\n", ""]);
+    }
+
+    #[test]
+    fn newline_eof() {
+        let text: Rope = "hello\n".into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(result, vec!["hello\n", ""]);
+    }
+
+    #[test]
+    fn no_newline_eof() {
+        let text: Rope = "hello".into();
+        let result = debug_breaks(&text, 4.0);
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn merged_offset() {
+        let text: Rope = "a quite\nshort text".into();
+        let mut builder = BreakBuilder::new();
+        builder.add_break(2);
+        builder.add_no_break(text.len() - 2);
+        let breaks = builder.build();
+        assert_eq!(merged_line_of_offset(&text, &breaks, 0), 0);
+        assert_eq!(merged_line_of_offset(&text, &breaks, 1), 0);
+        assert_eq!(merged_line_of_offset(&text, &breaks, 2), 1);
+        assert_eq!(merged_line_of_offset(&text, &breaks, 5), 1);
+        assert_eq!(merged_line_of_offset(&text, &breaks, 5), 1);
+        assert_eq!(merged_line_of_offset(&text, &breaks, 9), 2);
+        assert_eq!(merged_line_of_offset(&text, &breaks, text.len()), 2);
+
+        let text: Rope = "a quite\nshort tex\n".into();
+        // trailing newline increases total count
+        assert_eq!(merged_line_of_offset(&text, &breaks, text.len()), 3);
+    }
+
+    #[test]
+    fn bsearch_equivalence() {
+        let text: Rope =
+            "this is a line with some text in it, which is not unusual\n"
+                .repeat(1000)
+                .into();
+        let lines = make_lines(&text, 30.);
+
+        let mut linear = MergedBreaks::new(&text, &lines.breaks);
+        let mut binary = MergedBreaks::new(&text, &lines.breaks);
+
+        // skip zero because these two impls don't handle edge cases
+        for i in 1..1000 {
+            linear.set_offset(0);
+            binary.set_offset(0);
+            assert_eq!(
+                linear.offset_of_line_linear(i),
+                binary.offset_of_line_bsearch(i),
+                "line {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn merge_cursor_no_breaks() {
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
+        // first with no breaks
+        let breaks = Breaks::new_no_break(text.len());
+        let mut cursor = MergedBreaks::new(&text, &breaks);
+        assert_eq!(cursor.offset, 0);
+        assert_eq!(cursor.cur_line, 0);
+        assert_eq!(cursor.len, text.len());
+        assert_eq!(cursor.total_lines, 4);
+        assert!(cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(5));
+        assert_eq!(cursor.cur_line, 1);
+        assert_eq!(cursor.offset, 5);
+        assert_eq!(cursor.text.pos(), 5);
+        assert_eq!(cursor.soft.pos(), text.len());
+        assert!(cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(14));
+        assert_eq!(cursor.cur_line, 2);
+        assert_eq!(cursor.offset, 14);
+        assert_eq!(cursor.text.pos(), 14);
+        assert_eq!(cursor.soft.pos(), text.len());
+        assert!(cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(30));
+        assert_eq!(cursor.next(), None);
+    }
+
+    #[test]
+    fn merge_cursor_breaks() {
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
+
+        let mut builder = BreakBuilder::new();
+        builder.add_break(8);
+        builder.add_break(3);
+        builder.add_no_break(text.len() - (8 + 3));
+        let breaks = builder.build();
+
+        let mut cursor = MergedBreaks::new(&text, &breaks);
+        assert_eq!(cursor.offset, 0);
+        assert_eq!(cursor.cur_line, 0);
+        assert_eq!(cursor.len, text.len());
+        assert_eq!(cursor.total_lines, 6);
+
+        assert_eq!(cursor.next(), Some(5));
+        assert_eq!(cursor.cur_line, 1);
+        assert_eq!(cursor.offset, 5);
+        assert_eq!(cursor.text.pos(), 5);
+        assert_eq!(cursor.soft.pos(), 8);
+        assert!(cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(8));
+        assert_eq!(cursor.cur_line, 2);
+        assert_eq!(cursor.offset, 8);
+        assert_eq!(cursor.text.pos(), 14);
+        assert_eq!(cursor.soft.pos(), 8);
+        assert!(!cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(11));
+        assert_eq!(cursor.cur_line, 3);
+        assert_eq!(cursor.offset, 11);
+        assert_eq!(cursor.text.pos(), 14);
+        assert_eq!(cursor.soft.pos(), 11);
+        assert!(!cursor.is_hard_break());
+
+        assert_eq!(cursor.next(), Some(14));
+        assert_eq!(cursor.cur_line, 4);
+        assert_eq!(cursor.offset, 14);
+        assert_eq!(cursor.text.pos(), 14);
+        assert_eq!(cursor.soft.pos(), text.len());
+        assert!(cursor.is_hard_break());
+    }
+
+    #[test]
+    fn set_offset() {
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
+        let lines = make_lines(&text, 2.);
+        let mut merged = MergedBreaks::new(&text, &lines.breaks);
+        assert_eq!(merged.total_lines, 10);
+
+        let check_props = |m: &MergedBreaks, line, off, softpos, hardpos| {
+            assert_eq!(m.cur_line, line);
+            assert_eq!(m.offset, off);
+            assert_eq!(m.soft.pos(), softpos);
+            assert_eq!(m.text.pos(), hardpos);
+        };
+        merged.next();
+        check_props(&merged, 1, 5, 8, 5);
+        merged.set_offset(0);
+        check_props(&merged, 0, 0, 0, 0);
+        merged.set_offset(5);
+        check_props(&merged, 1, 5, 8, 5);
+        merged.set_offset(0);
+        merged.set_offset(6);
+        check_props(&merged, 1, 5, 8, 5);
+        merged.set_offset(9);
+        check_props(&merged, 2, 8, 8, 14);
+        merged.set_offset(text.len());
+        check_props(&merged, 9, 33, 33, 37);
+        merged.set_offset(text.len() - 1);
+        check_props(&merged, 9, 33, 33, 37);
+
+        // but a trailing newline adds a line at EOF
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff ggg\n".into();
+        let lines = make_lines(&text, 2.);
+        let mut merged = MergedBreaks::new(&text, &lines.breaks);
+        assert_eq!(merged.total_lines, 11);
+        merged.set_offset(text.len());
+        check_props(&merged, 10, 37, 37, 37);
+        merged.set_offset(text.len() - 1);
+        check_props(&merged, 9, 33, 33, 37);
+    }
+
+    #[test]
+    fn test_break_at_linear_transition() {
+        // do we handle the break at MAX_LINEAR_DIST correctly?
+        let text = "a b c d e f g h i j k l m n o p q r s t u v w x ".into();
+        let lines = make_lines(&text, 1.);
+
+        for offset in 0..text.len() {
+            let line = lines.visual_line_of_offset(&text, offset);
+            let line_offset = lines.offset_of_visual_line(&text, line);
+            assert!(
+                line_offset <= offset,
+                "{} <= {} L{:?} O{}",
+                line_offset,
+                offset,
+                line,
+                offset
+            );
+        }
+    }
+
+    #[test]
+    fn expected_soft_breaks() {
+        let text = "a b c d ".into();
+        let mut text_cursor = Cursor::new(&text, text.len());
+        assert!(!text_cursor.is_boundary::<LinesMetric>());
+
+        let Lines { breaks, .. } = make_lines(&text, 1.);
+        let mut cursor = Cursor::new(&breaks, 0);
+
+        cursor.set(2);
+        assert!(cursor.is_boundary::<BreaksMetric>());
+        cursor.set(4);
+        assert!(cursor.is_boundary::<BreaksMetric>());
+        cursor.set(6);
+        assert!(cursor.is_boundary::<BreaksMetric>());
+        cursor.set(8);
+        assert!(!cursor.is_boundary::<BreaksMetric>());
+
+        cursor.set(0);
+        let breaks = cursor.iter::<BreaksMetric>().collect::<Vec<_>>();
+        assert_eq!(breaks, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn expected_soft_with_hard() {
+        let text: Rope = "aa\nbb cc\ncc dd ee ff\ngggg".into();
+        let Lines { breaks, .. } = make_lines(&text, 2.);
+        let mut cursor = Cursor::new(&breaks, 0);
+        let breaks = cursor.iter::<BreaksMetric>().collect::<Vec<_>>();
+        assert_eq!(breaks, vec![6, 12, 15, 18]);
+    }
+
+    #[test]
+    fn offset_to_line() {
+        let text = "a b c d ".into();
+        let lines = make_lines(&text, 1.);
+        let cursor = MergedBreaks::new(&text, &lines.breaks);
+        assert_eq!(cursor.total_lines, 4);
+
+        assert_eq!(lines.visual_line_of_offset(&text, 0).get(), 0);
+        assert_eq!(lines.visual_line_of_offset(&text, 1).get(), 0);
+        assert_eq!(lines.visual_line_of_offset(&text, 2).get(), 1);
+        assert_eq!(lines.visual_line_of_offset(&text, 3).get(), 1);
+        assert_eq!(lines.visual_line_of_offset(&text, 4).get(), 2);
+        assert_eq!(lines.visual_line_of_offset(&text, 5).get(), 2);
+        assert_eq!(lines.visual_line_of_offset(&text, 6).get(), 3);
+        assert_eq!(lines.visual_line_of_offset(&text, 7).get(), 3);
+
+        assert_eq!(lines.offset_of_visual_line(&text, VisualLine(0)), 0);
+        assert_eq!(lines.offset_of_visual_line(&text, VisualLine(1)), 2);
+        assert_eq!(lines.offset_of_visual_line(&text, VisualLine(2)), 4);
+        assert_eq!(lines.offset_of_visual_line(&text, VisualLine(3)), 6);
+        assert_eq!(lines.offset_of_visual_line(&text, VisualLine(10)), 8);
+
+        for offset in 0..text.len() {
+            let line = lines.visual_line_of_offset(&text, offset);
+            let line_offset = lines.offset_of_visual_line(&text, line);
+            assert!(
+                line_offset <= offset,
+                "{} <= {} L{:?} O{}",
+                line_offset,
+                offset,
+                line,
+                offset
+            );
+        }
+    }
+
+    #[test]
+    fn iter_lines() {
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
+        let lines = make_lines(&text, 2.);
+        let r: Vec<_> = lines
+            .iter_lines(&text, VisualLine(0))
+            .take(2)
+            .map(|l| text.slice_to_cow(l.interval))
+            .collect();
+        assert_eq!(r, vec!["aaaa\n", "bb "]);
+
+        let r: Vec<_> = lines
+            .iter_lines(&text, VisualLine(1))
+            .take(2)
+            .map(|l| text.slice_to_cow(l.interval))
+            .collect();
+        assert_eq!(r, vec!["bb ", "bb "]);
+
+        let r: Vec<_> = lines
+            .iter_lines(&text, VisualLine(3))
+            .take(3)
+            .map(|l| text.slice_to_cow(l.interval))
+            .collect();
+        assert_eq!(r, vec!["cc\n", "cc ", "dddd "]);
+    }
+
+    #[test]
+    fn line_numbers() {
+        let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
+        let lines = make_lines(&text, 2.);
+        let nums: Vec<_> = lines
+            .iter_lines(&text, VisualLine(0))
+            .map(|l| l.line)
+            .collect();
+        assert_eq!(
+            nums,
+            vec![
+                Some(1),
+                Some(2),
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+                None,
+                Some(4),
+                None
+            ]
+        );
+    }
+
+    fn make_ranges(ivs: &[Interval]) -> Vec<Range<usize>> {
+        ivs.iter().map(|iv| iv.start..iv.end).collect()
+    }
+
+    #[test]
+    fn update_frontier() {
+        let mut lines = Lines::default();
+        lines.add_task(0..1000);
+        lines.update_tasks_after_wrap(0..10);
+        lines.update_tasks_after_wrap(50..100);
+        assert_eq!(make_ranges(&lines.work), vec![10..50, 100..1000]);
+        lines.update_tasks_after_wrap(200..1000);
+        assert_eq!(make_ranges(&lines.work), vec![10..50, 100..200]);
+        lines.add_task(300..400);
+        assert_eq!(make_ranges(&lines.work), vec![10..50, 100..200, 300..400]);
+        lines.add_task(250..350);
+        assert_eq!(make_ranges(&lines.work), vec![10..50, 100..200, 250..400]);
+        lines.add_task(60..450);
+        assert_eq!(make_ranges(&lines.work), vec![10..50, 60..450]);
+    }
+
+    #[test]
+    fn patchup_frontier() {
+        let mut lines = Lines::default();
+        lines.add_task(0..100);
+        assert_eq!(make_ranges(&lines.work), vec![0..100]);
+        lines.patchup_tasks(20..30, 20);
+        assert_eq!(make_ranges(&lines.work), vec![0..110]);
+
+        // delete everything?
+        lines.patchup_tasks(0..200, 0);
+        assert_eq!(make_ranges(&lines.work), vec![]);
+
+        lines.add_task(0..110);
+        lines.patchup_tasks(0..30, 0);
+        assert_eq!(make_ranges(&lines.work), vec![0..80]);
+        lines.update_tasks_after_wrap(20..30);
+        assert_eq!(make_ranges(&lines.work), vec![0..20, 30..80]);
+        lines.patchup_tasks(10..40, 0);
+        assert_eq!(make_ranges(&lines.work), vec![0..50]);
+        lines.update_tasks_after_wrap(20..30);
+        assert_eq!(make_ranges(&lines.work), vec![0..20, 30..50]);
+        lines.patchup_tasks(10..10, 10);
+        assert_eq!(make_ranges(&lines.work), vec![0..30, 40..60]);
+    }
+
+    /// https://github.com/xi-editor/xi-editor/issues/1112
+    #[test]
+    fn patchup_for_edit_before_task() {
+        let mut lines = Lines::default();
+        lines.add_task(0..100);
+        lines.update_tasks_after_wrap(0..30);
+        assert_eq!(make_ranges(&lines.work), vec![30..100]);
+        lines.patchup_tasks(5..90, 80);
+        assert_eq!(make_ranges(&lines.work), vec![85..95]);
     }
 }
