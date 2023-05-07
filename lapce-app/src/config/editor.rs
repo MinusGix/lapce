@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use structdesc::FieldNames;
 
+use crate::doc::display_line::WrapStyle;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum ClickMode {
     #[default]
@@ -10,6 +12,21 @@ pub enum ClickMode {
     DoubleClickFile,
     #[serde(rename = "all")]
     DoubleClickAll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum WrapMode {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    /// Wrap at a specific byte count
+    #[serde(rename = "byte")]
+    Byte,
+    /// Wrap at a specific width
+    #[serde(rename = "width")]
+    Width,
+    // TODO: wrap at editor width. This probably requires decoupling `Lines` from the document and putting it on the view?
+    // TODO: wrap at 'standard' single editor width. Like, your screen is 1920px wide, subtract the ui elements on the side, and then use that as the width. A half-size mode would also be good. This is less potentially cramped than using editor width, and is more consistent.
 }
 
 #[derive(FieldNames, Debug, Clone, Deserialize, Serialize, Default)]
@@ -27,6 +44,12 @@ pub struct EditorConfig {
     line_height: f64,
     #[field_names(desc = "Set the tab width")]
     pub tab_width: usize,
+    #[field_names(desc = "Wrapping mode")]
+    pub wrap_mode: WrapMode,
+    #[field_names(desc = "The number of bytes to wrap at in byte wrap mode")]
+    pub wrap_bytes: usize,
+    #[field_names(desc = "The number of text pixels to wrap at in width wrap mode")]
+    pub wrap_width: f64,
     #[field_names(desc = "If opened editors are shown in a tab")]
     pub show_tab: bool,
     #[field_names(desc = "If navigation breadcrumbs are shown for the file")]
@@ -184,6 +207,14 @@ impl EditorConfig {
             self.font_size
         } else {
             self.error_lens_font_size
+        }
+    }
+
+    pub fn wrap_style(&self) -> WrapStyle {
+        match self.wrap_mode {
+            WrapMode::None => WrapStyle::None,
+            WrapMode::Byte => WrapStyle::Bytes(self.wrap_bytes),
+            WrapMode::Width => WrapStyle::Width(self.wrap_width),
         }
     }
 }

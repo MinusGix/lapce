@@ -48,7 +48,7 @@ use crate::{
 };
 
 use self::{
-    display_line::{Lines, VisualLine, VisualLineEntry, WrapWidth},
+    display_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
     width_calc::BasicWidthCalc,
 };
@@ -201,27 +201,31 @@ pub struct Document {
 pub struct DocLine {
     pub rev: u64,
     pub style_rev: u64,
-    pub line: usize,
+    pub line_info: VisualLineEntry,
     pub text: Arc<TextLayoutLine>,
-    pub code_actions: Option<Arc<(PluginId, CodeActionResponse)>>,
 }
 
 impl VirtualListVector<DocLine> for Document {
     type ItemIterator = std::vec::IntoIter<DocLine>;
 
     fn total_len(&self) -> usize {
-        self.buffer.num_lines()
+        self.lines.last_visual_line(&self.buffer.text()).vline.get() + 1
     }
 
     fn slice(&mut self, range: std::ops::Range<usize>) -> Self::ItemIterator {
-        let lines = range
-            .into_iter()
-            .map(|line| DocLine {
+        // TODO: is this where we should do necessary rewrap?
+        let lines = self
+            .lines
+            .iter_lines_over(
+                &self.buffer.text(),
+                VisualLine(range.start),
+                VisualLine(range.end),
+            )
+            .map(|line_info| DocLine {
                 rev: self.buffer.rev(),
                 style_rev: self.style_rev,
-                line,
-                text: self.get_text_layout_with_line(VisualLine(line), 12),
-                code_actions: self.code_actions.get(&line).cloned(),
+                line_info,
+                text: self.get_text_layout(line_info, 12),
             })
             .collect::<Vec<_>>();
         lines.into_iter()
@@ -303,8 +307,10 @@ impl Document {
         self.loaded = true;
         self.on_update(None);
         self.init_diagnostics();
-        self.lines
-            .set_wrap_width(self.buffer.text(), WrapWidth::Bytes(30));
+
+        let config = self.config.get_untracked();
+        let wrap_style = config.editor.wrap_style();
+        self.lines.set_wrap_style(self.buffer.text(), wrap_style);
 
         // This might be a fine place to do this, but it may be better to do it wherever this is getting drawn. We should also only pay attention to actually visible lines, but that depends on the scroll position!
         let mut width_calc = {

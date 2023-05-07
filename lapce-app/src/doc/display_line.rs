@@ -1,8 +1,3 @@
-// Use `Breaks` for phantom text line breaks, there'd just be multiple at one position which should be fine.
-// We can have DisplayLine be more of a (real line, line shift) pair, rather than a single usize since that makes it easier to update it. We'd just supply an iterator over them for things that need that.
-// And textlayoutcache can just have a SmallVec<[TextLayout; 2] or something.
-// This make it nicer to clear cached lines and avoid issues of 'is this displayline old or not?'
-
 // This is based on xi-editor's line-wrap logic
 
 use std::{borrow::Cow, cmp::Ordering, ops::Range};
@@ -23,7 +18,7 @@ use super::width_calc::WidthCalc;
 
 /// The visual width of the buffer for the purpose of word wrapping.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum WrapWidth {
+pub enum WrapStyle {
     /// No wrapping in effect.
     None,
 
@@ -36,18 +31,17 @@ pub enum WrapWidth {
     Width(f64),
     // TODO: setting for whether phantom text should be included in wrap length logic
     // (ex: if you're just fitting a style guide, like limit of 100 chars per line, then bytes works and shouldn't count phantom text; but if you're wanting it so that the text always fits on your screen, then you want to include phantom text)
-    // TODO: some users would want the width to automatically fit the editor size, though that should be managed outside of this code.
 }
 
-impl Default for WrapWidth {
+impl Default for WrapStyle {
     fn default() -> Self {
-        WrapWidth::None
+        WrapStyle::None
     }
 }
 
-impl WrapWidth {
-    fn differs_in_kind(self, other: WrapWidth) -> bool {
-        use self::WrapWidth::*;
+impl WrapStyle {
+    fn differs_in_kind(self, other: WrapStyle) -> bool {
+        use self::WrapStyle::*;
         match (self, other) {
             (None, None) | (Bytes(_), Bytes(_)) | (Width(_), Width(_)) => false,
             _else => true,
@@ -66,20 +60,24 @@ impl VisualLine {
 #[derive(Debug, Clone, Copy)]
 pub struct VisualLineEntry {
     pub interval: Interval,
-    /// The buffer line number for this line. This is only set for the first visual line of a
-    /// buffer line.
-    pub line: Option<usize>,
+    /// The buffer line number for this line.
+    pub line: usize,
+    /// Whether this is the first visual line for the buffer line.  
+    /// Used for deciding whether to render the line number.
+    pub is_first: bool,
     pub vline: VisualLine,
 }
 impl VisualLineEntry {
-    fn new<I: Into<Interval>, L: Into<Option<usize>>>(
+    fn new<I: Into<Interval>>(
         iv: I,
-        line: L,
+        line: usize,
+        is_first: bool,
         vline: VisualLine,
     ) -> Self {
         VisualLineEntry {
             interval: iv.into(),
-            line: line.into(),
+            line,
+            is_first,
             vline,
         }
     }
@@ -135,13 +133,13 @@ type Task = Interval;
 pub struct Lines {
     /// Tracks linebreak information
     breaks: Breaks,
-    wrap: WrapWidth,
+    wrap: WrapStyle,
     // TODO: Document relies on being relatively cheap to clone
     /// Ranges of lines that need be wrapped.
     work: Vec<Task>,
 }
 impl Lines {
-    pub fn set_wrap_width(&mut self, text: &Rope, wrap: WrapWidth) {
+    pub fn set_wrap_style(&mut self, text: &Rope, wrap: WrapStyle) {
         // We have to rewrap everything
         self.work.clear();
         self.add_task(0..text.len());
@@ -198,7 +196,7 @@ impl Lines {
 
     /// Check if the wrapping is finished
     pub fn is_converged(&self) -> bool {
-        self.wrap == WrapWidth::None || self.work.is_empty()
+        self.wrap == WrapStyle::None || self.work.is_empty()
     }
 
     /// Check if the interval intersects with any work that needs to be done.
@@ -208,7 +206,7 @@ impl Lines {
 
     pub fn visual_line_of_offset(&self, text: &Rope, offset: usize) -> VisualLine {
         let mut line = text.line_of_offset(offset);
-        if self.wrap != WrapWidth::None {
+        if self.wrap != WrapStyle::None {
             line += self.breaks.count::<BreaksMetric>(offset);
         }
         VisualLine(line)
@@ -228,7 +226,7 @@ impl Lines {
 
     pub fn offset_of_visual_line(&self, text: &Rope, line: VisualLine) -> usize {
         match self.wrap {
-            WrapWidth::None => {
+            WrapStyle::None => {
                 // Ensure that it does not exceed the rope line count
                 let line = line.get().min(text.measure::<LinesMetric>() + 1);
                 text.offset_of_line(line)
@@ -251,6 +249,18 @@ impl Lines {
         line_offset + col
     }
 
+    pub fn last_visual_line(&self, text: &Rope) -> VisualLineEntry {
+        // TODO: we may be able to skip ahead more efficiently?
+        self.iter_lines(text, VisualLine(0))
+            .last()
+            .unwrap_or(VisualLineEntry {
+                interval: Interval::new(0, 0),
+                line: 0,
+                is_first: true,
+                vline: VisualLine(0),
+            })
+    }
+
     /// Iterator over [`VisualLineEntry`]s, starting at `start_line`
     pub fn iter_lines<'a>(
         &'a self,
@@ -259,16 +269,27 @@ impl Lines {
     ) -> impl Iterator<Item = VisualLineEntry> + 'a {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(start_line);
-        let logical_line = text.line_of_offset(offset) + 1;
+        let buffer_line = text.line_of_offset(offset);
         cursor.set_offset(offset);
         VisualLines {
             offset,
             cursor,
             len: text.len(),
-            logical_line,
+            buffer_line,
             eof: false,
             cur_line: start_line,
         }
+    }
+
+    /// Iterator over [`VisualLineEntry`]s in the range `start_line..end_line`
+    pub fn iter_lines_over<'a>(
+        &'a self,
+        text: &'a Rope,
+        start_line: VisualLine,
+        end_line: VisualLine,
+    ) -> impl Iterator<Item = VisualLineEntry> + 'a {
+        self.iter_lines(text, start_line)
+            .take_while(move |entry| entry.vline < end_line)
     }
 
     /// Returns the next task, prioritizing the currently visible region.  
@@ -409,7 +430,7 @@ impl Lines {
         self.breaks.edit(iv, builder.build());
         self.patchup_tasks(iv, newlen);
 
-        if self.wrap == WrapWidth::None {
+        if self.wrap == WrapStyle::None {
             return Some(InvalLines {
                 start_line: logical_start_line,
                 inval_count: old_hard_count,
@@ -453,7 +474,7 @@ impl Lines {
         visible_lines: Range<VisualLine>,
         max_lines: Option<usize>,
     ) -> WrapSummary {
-        use self::WrapWidth::*;
+        use self::WrapStyle::*;
         // 'line' is a poor unit here; could do some fancy Duration thing?
         const MAX_LINES_PER_BATCH: usize = 500;
 
@@ -554,9 +575,9 @@ impl Lines {
     }
 
     #[cfg(test)]
-    fn for_testing(text: &Rope, wrap: WrapWidth) -> Lines {
+    fn for_testing(text: &Rope, wrap: WrapStyle) -> Lines {
         let mut lines = Lines::default();
-        lines.set_wrap_width(text, wrap);
+        lines.set_wrap_style(text, wrap);
         lines
     }
 
@@ -720,8 +741,7 @@ impl<'a> LineBreakCursor<'a> {
 struct VisualLines<'a> {
     cursor: MergedBreaks<'a>,
     offset: usize,
-    /// The current logical line number.
-    logical_line: usize,
+    buffer_line: usize,
     len: usize,
     eof: bool,
     cur_line: VisualLine,
@@ -731,11 +751,12 @@ impl<'a> Iterator for VisualLines<'a> {
     type Item = VisualLineEntry;
 
     fn next(&mut self) -> Option<VisualLineEntry> {
-        let line_num = if self.cursor.is_hard_break() {
-            Some(self.logical_line)
-        } else {
-            None
-        };
+        let is_first = self.cursor.is_hard_break();
+        if is_first {
+            self.buffer_line += 1;
+        }
+        let line_num = self.buffer_line.saturating_sub(1);
+
         let next_end_bound = match self.cursor.next() {
             Some(b) => b,
             None if self.eof => return None,
@@ -747,11 +768,10 @@ impl<'a> Iterator for VisualLines<'a> {
         let result = VisualLineEntry::new(
             self.offset..next_end_bound,
             line_num,
+            is_first,
             self.cur_line,
         );
-        if self.cursor.is_hard_break() {
-            self.logical_line += 1;
-        }
+
         self.offset = next_end_bound;
         self.cur_line = VisualLine(self.cur_line.get() + 1);
         Some(result)
@@ -926,7 +946,7 @@ mod tests {
         display_line::merged_line_of_offset, width_calc::ByteWidthCalc,
     };
 
-    use super::{Lines, MergedBreaks, VisualLine, WrapWidth};
+    use super::{Lines, MergedBreaks, VisualLine, WrapStyle};
 
     #[test]
     fn breaks_multiple() {
@@ -951,7 +971,7 @@ mod tests {
 
     fn make_lines(text: &Rope, width: f64) -> Lines {
         let mut width_calc = ByteWidthCalc;
-        let wrap = WrapWidth::Bytes(width as usize);
+        let wrap = WrapStyle::Bytes(width as usize);
         let mut lines = Lines::for_testing(text, wrap);
         lines.rewrap_all(text, &mut width_calc);
         assert!(lines.is_converged());
@@ -1343,21 +1363,28 @@ mod tests {
         let lines = make_lines(&text, 2.);
         let nums: Vec<_> = lines
             .iter_lines(&text, VisualLine(0))
-            .map(|l| l.line)
+            .map(|l| {
+                (
+                    l.line,
+                    l.vline.get(),
+                    l.is_first,
+                    text.slice_to_cow(l.interval),
+                )
+            })
             .collect();
         assert_eq!(
             nums,
             vec![
-                Some(1),
-                Some(2),
-                None,
-                None,
-                Some(3),
-                None,
-                None,
-                None,
-                Some(4),
-                None
+                (0, 0, true, "aaaa\n".into()),
+                (1, 1, true, "bb ".into()),
+                (1, 2, false, "bb ".into()),
+                (1, 3, false, "cc\n".into()),
+                (2, 4, true, "cc ".into()),
+                (2, 5, false, "dddd ".into()),
+                (2, 6, false, "eeee ".into()),
+                (2, 7, false, "ff\n".into()),
+                (3, 8, true, "ff ".into()),
+                (3, 9, false, "gggg".into()),
             ]
         );
     }

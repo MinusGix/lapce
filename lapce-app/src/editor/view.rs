@@ -342,7 +342,8 @@ fn editor_gutter(
             let doc = editor.with(|editor| editor.doc);
             let offset = cursor.with(|cursor| cursor.offset());
             doc.with(|doc| {
-                let line = doc.buffer().line_of_offset(offset);
+                let line = doc.visual_line_of_offset(offset);
+                // let line = doc.buffer().line_of_offset(offset);
                 let has_code_actions = doc
                     .code_actions
                     .get(&offset)
@@ -363,10 +364,7 @@ fn editor_gutter(
         let doc = editor.with(|editor| editor.doc);
         let (offset, mode) =
             cursor.with(|cursor| (cursor.offset(), cursor.get_mode()));
-        let line = doc.with(|doc| {
-            let line = doc.buffer().line_of_offset(offset);
-            line
-        });
+        let line = doc.with(|doc| doc.buffer().line_of_offset(offset));
         (line, mode)
     });
 
@@ -396,7 +394,10 @@ fn editor_gutter(
                         current_line.get();
                         editor.doc.get()
                     },
-                    move |line: &DocLine| (line.line, current_line.get_untracked()),
+                    // TODO: is this the right key to use?
+                    move |line: &DocLine| {
+                        (line.line_info.vline, current_line.get_untracked())
+                    },
                     move |cx, line: DocLine| {
                         let line_number = {
                             let config = config.get_untracked();
@@ -405,13 +406,24 @@ fn editor_gutter(
                                 && config.editor.modal_mode_relative_line_numbers
                                 && mode != Mode::Insert
                             {
-                                if line.line == current_line {
-                                    line.line + 1
+                                if line.line_info.is_first {
+                                    if line.line_info.line == current_line {
+                                        Some(line.line_info.line + 1)
+                                    } else {
+                                        Some(
+                                            line.line_info
+                                                .line
+                                                .abs_diff(current_line),
+                                        )
+                                    }
                                 } else {
-                                    line.line.abs_diff(current_line)
+                                    None
                                 }
+                            } else if line.line_info.is_first {
+                                Some(line.line_info.line + 1)
                             } else {
-                                line.line + 1
+                                // We only render the line number for the line in a visual line
+                                None
                             }
                         };
 
@@ -420,7 +432,12 @@ fn editor_gutter(
                                 label(cx, || "".to_string()).style(cx, move || {
                                     Style::BASE.width_px(padding_left)
                                 }),
-                                label(cx, move || line_number.to_string()).style(
+                                label(cx, move || {
+                                    line_number
+                                        .map(|x| x.to_string())
+                                        .unwrap_or(String::new())
+                                })
+                                .style(
                                     cx,
                                     move || {
                                         let config = config.get();
@@ -429,7 +446,7 @@ fn editor_gutter(
                                         Style::BASE
                                             .flex_grow(1.0)
                                             .apply_if(
-                                                current_line != line.line,
+                                                current_line != line.line_info.line,
                                                 move |s| {
                                                     s.color(*config.get_color(
                                                         LapceColor::EDITOR_DIM,
@@ -466,10 +483,11 @@ fn editor_gutter(
                                                 });
                                             },
                                         )
+                                        // TODO: code actions can specify where they appear, right? So they should appear on the *wrapped line* that they apply to!
                                         .style(cx, move || {
                                             Style::BASE.apply_if(
                                                 code_action_line.get()
-                                                    != Some(line.line),
+                                                    != Some(line.line_info.vline),
                                                 |s| s.hide(),
                                             )
                                         })
@@ -767,7 +785,7 @@ fn editor_content(cx: AppContext, editor: RwSignal<EditorData>) -> impl View {
                 .with_untracked(|doc| doc.content.clone()),
             line.rev,
             line.style_rev,
-            line.line,
+            line.line_info.vline,
         )
     };
     let view_fn = move |cx, line: DocLine| {
