@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use structdesc::FieldNames;
 
-use crate::doc::display_line::WrapStyle;
+use crate::doc::visual_line::WrapStyle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum ClickMode {

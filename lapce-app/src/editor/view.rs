@@ -24,7 +24,7 @@ use lapce_core::{
 use crate::{
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     doc::{
-        display_line::{VisualLine, VisualLineEntry},
+        visual_line::{VisualLine, VisualLineEntry},
         DocLine, Document, LineExtraStyle,
     },
     wave::wave_line,

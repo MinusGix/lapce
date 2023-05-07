@@ -937,13 +937,12 @@ mod tests {
     use std::{borrow::Cow, ops::Range};
 
     use lapce_xi_rope::{
-        breaks::{BreakBuilder, Breaks, BreaksInfo, BreaksMetric},
-        tree::Node,
+        breaks::{BreakBuilder, Breaks, BreaksMetric},
         Cursor, Interval, LinesMetric, Rope,
     };
 
     use crate::doc::{
-        display_line::merged_line_of_offset, width_calc::ByteWidthCalc,
+        visual_line::merged_line_of_offset, width_calc::ByteWidthCalc,
     };
 
     use super::{Lines, MergedBreaks, VisualLine, WrapStyle};

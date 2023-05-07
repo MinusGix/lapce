@@ -48,12 +48,12 @@ use crate::{
 };
 
 use self::{
-    display_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
+    visual_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
     width_calc::BasicWidthCalc,
 };
 
-pub mod display_line;
+pub mod visual_line;
 mod phantom_text;
 mod width_calc;
 
