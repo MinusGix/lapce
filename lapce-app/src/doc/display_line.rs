@@ -7,7 +7,10 @@
 
 use std::{borrow::Cow, cmp::Ordering, ops::Range};
 
-use lapce_core::buffer::InvalLines;
+use lapce_core::{
+    buffer::{rope_text::RopeText, InvalLines},
+    word::WordCursor,
+};
 use lapce_xi_rope::{
     breaks::{BreakBuilder, Breaks, BreaksInfo, BreaksMetric},
     Cursor, Interval, LinesMetric, Rope, RopeDelta, RopeInfo,
@@ -60,18 +63,52 @@ impl VisualLine {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct VisualLineEntry {
     pub interval: Interval,
     /// The buffer line number for this line. This is only set for the first visual line of a
     /// buffer line.
     pub line: Option<usize>,
+    pub vline: VisualLine,
 }
 impl VisualLineEntry {
-    fn new<I: Into<Interval>, L: Into<Option<usize>>>(iv: I, line: L) -> Self {
+    fn new<I: Into<Interval>, L: Into<Option<usize>>>(
+        iv: I,
+        line: L,
+        vline: VisualLine,
+    ) -> Self {
         VisualLineEntry {
             interval: iv.into(),
             line: line.into(),
+            vline,
         }
+    }
+
+    // TODO: does this include \n? Should it?
+    // TODO: should this have a + 1 if caret?
+    pub fn last_col(&self, caret: bool) -> usize {
+        self.interval.end - self.interval.start
+    }
+
+    // TODO: we could generalize `RopeText::line_end_offset` to any interval, and then just use it here instead of basically reimplementing it.
+    pub fn line_end_offset(&self, text: &Rope, caret: bool) -> usize {
+        let mut offset = self.interval.end;
+        let mut line_content: &str = &text.slice_to_cow(self.interval);
+        if line_content.ends_with("\r\n") {
+            offset -= 2;
+            line_content = &line_content[..line_content.len() - 2];
+        } else if line_content.ends_with('\n') {
+            offset -= 1;
+            line_content = &line_content[..line_content.len() - 1];
+        }
+        if !caret && !line_content.is_empty() {
+            offset = RopeText::new(text).prev_grapheme_offset(offset, 1, 0);
+        }
+        offset
+    }
+
+    pub fn first_non_blank_character(&self, text: &Rope) -> usize {
+        WordCursor::new(&text, self.interval.start).next_non_blank_char()
     }
 }
 
@@ -177,6 +214,18 @@ impl Lines {
         VisualLine(line)
     }
 
+    pub fn visual_line_col_of_offset(
+        &self,
+        text: &Rope,
+        offset: usize,
+    ) -> (VisualLine, usize) {
+        // TODO: this is probably doing extra unneeded work
+        let line = self.visual_line_of_offset(text, offset);
+        let line_offset = self.offset_of_visual_line(text, line);
+        let col = offset - line_offset;
+        (line, col)
+    }
+
     pub fn offset_of_visual_line(&self, text: &Rope, line: VisualLine) -> usize {
         match self.wrap {
             WrapWidth::None => {
@@ -191,7 +240,18 @@ impl Lines {
         }
     }
 
-    /// Iterator over [`VisualLine`]s, starting at `start_line`
+    pub fn offset_of_visual_line_col(
+        &self,
+        text: &Rope,
+        line: VisualLine,
+        col: usize,
+    ) -> usize {
+        // TODO: buffer offset_of_line_col does more intricate logic!
+        let line_offset = self.offset_of_visual_line(text, line);
+        line_offset + col
+    }
+
+    /// Iterator over [`VisualLineEntry`]s, starting at `start_line`
     pub fn iter_lines<'a>(
         &'a self,
         text: &'a Rope,
@@ -207,6 +267,7 @@ impl Lines {
             len: text.len(),
             logical_line,
             eof: false,
+            cur_line: start_line,
         }
     }
 
@@ -479,7 +540,7 @@ impl Lines {
         }
     }
 
-    pub fn logical_line_range(
+    pub fn visual_line_range(
         &self,
         text: &Rope,
         line: VisualLine,
@@ -663,6 +724,7 @@ struct VisualLines<'a> {
     logical_line: usize,
     len: usize,
     eof: bool,
+    cur_line: VisualLine,
 }
 
 impl<'a> Iterator for VisualLines<'a> {
@@ -682,11 +744,16 @@ impl<'a> Iterator for VisualLines<'a> {
                 self.len
             }
         };
-        let result = VisualLineEntry::new(self.offset..next_end_bound, line_num);
+        let result = VisualLineEntry::new(
+            self.offset..next_end_bound,
+            line_num,
+            self.cur_line,
+        );
         if self.cursor.is_hard_break() {
             self.logical_line += 1;
         }
         self.offset = next_end_bound;
+        self.cur_line = VisualLine(self.cur_line.get() + 1);
         Some(result)
     }
 }
