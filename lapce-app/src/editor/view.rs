@@ -126,7 +126,7 @@ fn visual_cursor(
             }
             VisualMode::Linewise => 0,
             VisualMode::Blockwise => {
-                let max_col = line_info.last_col(false);
+                let max_col = doc.last_col(line_info, false);
                 let left = start_col.min(end_col);
                 if left > max_col {
                     continue;
@@ -138,7 +138,7 @@ fn visual_cursor(
         let (right_col, line_end) = match mode {
             VisualMode::Normal => {
                 if line == end_line {
-                    let max_col = line_info.last_col(true);
+                    let max_col = doc.last_col(line_info, true);
 
                     let end_offset =
                         doc.buffer().move_right(start.max(end), Mode::Visual, 1);
@@ -146,12 +146,12 @@ fn visual_cursor(
 
                     (end_col.min(max_col), false)
                 } else {
-                    (line_info.last_col(true), true)
+                    (doc.last_col(line_info, true), true)
                 }
             }
-            VisualMode::Linewise => (line_info.last_col(true), true),
+            VisualMode::Linewise => (doc.last_col(line_info, true), true),
             VisualMode::Blockwise => {
-                let max_col = line_info.last_col(true);
+                let max_col = doc.last_col(line_info, true);
                 let right = match horiz.as_ref() {
                     Some(&ColPosition::End) => max_col,
                     _ => {
@@ -236,11 +236,10 @@ fn insert_cursor(
             };
             let (right_col, line_end) = match line {
                 _ if line == end_line => {
-                    let max_col = line_info.last_col(true);
+                    let max_col = doc.last_col(line_info, true);
                     (end_col.min(max_col), false)
                 }
-                // _ => (doc.buffer().line_end_col(line, true), true),
-                _ => (line_info.last_col(true), true),
+                _ => (doc.last_col(line_info, true), true),
             };
 
             // Shift it by the inlay hints

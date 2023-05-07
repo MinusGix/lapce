@@ -48,13 +48,13 @@ use crate::{
 };
 
 use self::{
-    visual_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
+    visual_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
     width_calc::BasicWidthCalc,
 };
 
-pub mod visual_line;
 mod phantom_text;
+pub mod visual_line;
 mod width_calc;
 
 pub struct SystemClipboard {}
@@ -416,13 +416,22 @@ impl Document {
             BasicWidthCalc::new(family, font_size)
         };
 
+        let mut cur_prev_text = prev_text.clone();
         for (i, (delta, _, _)) in deltas.iter().enumerate() {
+            // If there's any remaining deltas, then we apply this delta to prev_text
+            let cur_text = if i < deltas.len() - 1 {
+                delta.apply(prev_text)
+            } else {
+                // the current buffer alreadyt has the last/only delta applied
+                self.buffer.text().clone()
+            };
+
             self.update_styles(delta);
             self.update_inlay_hints(delta);
             self.update_diagnostics(delta);
             self.lines.after_edit(
-                self.buffer.text(),
-                prev_text,
+                &cur_text,
+                &cur_prev_text,
                 delta,
                 &mut width_calc,
                 VisualLine(0)..VisualLine(1000),
@@ -432,6 +441,8 @@ impl Document {
                 self.proxy
                     .update(path.clone(), delta.clone(), rev + i as u64 + 1);
             }
+
+            cur_prev_text = cur_text;
         }
         // TODO: do we actually need to do this? probably not
         self.clear_text_layout_cache();
@@ -511,6 +522,15 @@ impl Document {
         self.lines.iter_lines(&self.buffer.text(), line).next()
     }
 
+    pub fn last_visual_line_entry(&self) -> VisualLineEntry {
+        self.lines.last_visual_line(&self.buffer.text())
+    }
+
+    // TODO: we could just have a trait for 'treat this as a rope' and implement it for ropes and document, so then this can purely be a method on VisualLineEntry, passing in the doc/rope. This would also avoid other repetitive functions.
+    pub fn last_col(&self, line: VisualLineEntry, caret: bool) -> usize {
+        line.last_col(&self.buffer.text(), caret)
+    }
+
     pub fn iter_visual_lines<'a>(
         &'a self,
         start_line: VisualLine,
@@ -545,9 +565,9 @@ impl Document {
                 let hit_point = text_layout.text.hit_point(Point::new(x, 0.0));
                 let n = hit_point.index;
 
-                n.min(line.last_col(caret))
+                n.min(self.last_col(line, caret))
             }
-            ColPosition::End => line.last_col(caret),
+            ColPosition::End => self.last_col(line, caret),
             ColPosition::Start => 0,
             ColPosition::FirstNonBlank => {
                 line.first_non_blank_character(&self.buffer.text())
@@ -645,7 +665,18 @@ impl Document {
                 (new_offset, None)
             }
             Movement::Right => {
+                println!("Move right");
+                println!("\tOffset: {offset:?}; mode: {mode:?}; count: {count:?}");
+                println!(
+                    "\tPrev line col: {:?}",
+                    self.visual_line_col_of_offset(offset)
+                );
                 let mut new_offset = self.buffer.move_right(offset, mode, count);
+                println!("\tNew offset: {new_offset:?}");
+                println!(
+                    "\tNew line col: {:?}",
+                    self.visual_line_col_of_offset(new_offset)
+                );
 
                 if config.editor.atomic_soft_tabs && config.editor.tab_width > 1 {
                     new_offset = snap_to_soft_tab(
@@ -659,11 +690,13 @@ impl Document {
                 (new_offset, None)
             }
             Movement::Up => {
+                println!("Move up");
                 let font_size = config.editor.font_size;
 
                 let line = self
                     .lines
                     .visual_line_of_offset(&self.buffer.text(), offset);
+                println!("\tLine: {line:?}");
                 if line.get() == 0 {
                     let new_offset =
                         self.lines.offset_of_visual_line(&self.buffer.text(), line);
@@ -672,6 +705,7 @@ impl Document {
                             self.line_point_of_offset(offset, font_size).x,
                         )
                     });
+                    println!("\tnew_offset: {new_offset:?} horiz: {horiz:?}");
 
                     return (new_offset, Some(horiz));
                 }
@@ -681,6 +715,7 @@ impl Document {
                     // Should this just assume that the col it got was zero, and thus the new offset it got was also 0? or would it be at the end?
                     todo!()
                 };
+                println!("\tnew line: {line:?}; line_info: {line_info:?}");
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
@@ -695,6 +730,9 @@ impl Document {
                     &self.buffer.text(),
                     line,
                     col,
+                );
+                println!(
+                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?}"
                 );
                 (new_offset, Some(horiz))
             }
@@ -750,10 +788,9 @@ impl Document {
                 }
 
                 let line = VisualLine(line.get() + count);
-                let Some(line_info) = self.visual_line_entry(line) else {
-                    // Should this just assume that the col it got was zero, and thus the new offset it got was also 0? or would it be at the end? Should it force wrapping at the last line if the cursor is going to be on the last buffer line?
-                    todo!()
-                };
+                let line_info = self
+                    .visual_line_entry(line)
+                    .unwrap_or_else(|| self.last_visual_line_entry());
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)

@@ -82,10 +82,10 @@ impl VisualLineEntry {
         }
     }
 
-    // TODO: does this include \n? Should it?
-    // TODO: should this have a + 1 if caret?
-    pub fn last_col(&self, caret: bool) -> usize {
-        self.interval.end - self.interval.start
+    pub fn last_col(&self, text: &Rope, caret: bool) -> usize {
+        let line_start = self.interval.start;
+        let end_offset = self.line_end_offset(text, caret);
+        end_offset - line_start
     }
 
     // TODO: we could generalize `RopeText::line_end_offset` to any interval, and then just use it here instead of basically reimplementing it.
