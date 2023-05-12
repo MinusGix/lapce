@@ -57,17 +57,13 @@ fn cursor_caret(
     block: bool,
     affinity: CursorAffinity,
 ) -> CursorRender {
-    // let (line, col) = doc.buffer().offset_to_line_col(offset);
     let (line, col) = doc.visual_line_col_of_offset(offset, affinity);
-    // TODO: don't unwrap
-    let line_info = doc.visual_line_entry(line).unwrap();
-    // println!("cursor_caret line={line_info:?}; col: {col}; affinity: {affinity:?} block: {block}");
+    let line_info = doc.visual_line_entry(line);
     let phantom_text = doc.line_phantom_text(line_info);
     let col = phantom_text.col_after(col, block);
     let x0 = doc.line_point_of_line_col(line_info, col, 12).x;
     if block {
         let right_offset = doc.buffer().move_right(offset, Mode::Insert, 1);
-        // let (_, right_col) = doc.buffer().offset_to_line_col(right_offset);
         let (_, right_col) = doc.visual_line_col_of_offset(right_offset, affinity);
         let x1 = doc.line_point_of_line_col(line_info, right_col, 12).x;
 
@@ -354,7 +350,6 @@ fn editor_gutter(
                 cursor.with(|cursor| (cursor.offset(), cursor.affinity));
             doc.with(|doc| {
                 let line = doc.visual_line_of_offset(offset, affinity);
-                // let line = doc.buffer().line_of_offset(offset);
                 let has_code_actions = doc
                     .code_actions
                     .get(&offset)
@@ -599,10 +594,8 @@ fn editor_cursor(
         doc.with(|doc| {
             cursor.with(|cursor| match &cursor.mode {
                 CursorMode::Normal(offset) => {
-                    // let line = doc.buffer().line_of_offset(*offset);
                     let line = doc.visual_line_of_offset(*offset, cursor.affinity);
-                    // TODO: don't unwrap?
-                    let line_info = doc.visual_line_entry(line).unwrap();
+                    let line_info = doc.visual_line_entry(line);
                     let mut renders =
                         vec![(viewport, CursorRender::CurrentLine { line_info })];
                     if is_active {

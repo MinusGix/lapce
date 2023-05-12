@@ -49,7 +49,7 @@ use crate::{
 
 use self::{
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
-    visual_line::{Lines, VisualLine, VisualLineEntry, WrapStyle},
+    visual_line::{Lines, VisualLine, VisualLineEntry},
     width_calc::BasicWidthCalc,
 };
 
@@ -519,9 +519,11 @@ impl Document {
         self.code_actions.clear();
     }
 
-    // TODO: should this just default to the last visual line entry if `None`?
-    pub fn visual_line_entry(&self, line: VisualLine) -> Option<VisualLineEntry> {
-        self.lines.iter_lines(&self.buffer.text(), line).next()
+    pub fn visual_line_entry(&self, line: VisualLine) -> VisualLineEntry {
+        self.lines
+            .iter_lines(&self.buffer.text(), line)
+            .next()
+            .unwrap_or_else(|| self.last_visual_line_entry())
     }
 
     pub fn last_visual_line_entry(&self) -> VisualLineEntry {
@@ -704,9 +706,7 @@ impl Document {
                 }
 
                 let (line, col) = self.visual_line_col_of_offset(offset, *affinity);
-                let line_info = self
-                    .visual_line_entry(line)
-                    .unwrap_or_else(|| self.last_visual_line_entry());
+                let line_info = self.visual_line_entry(line);
 
                 if col == line_info.last_col(self.buffer.text(), true) {
                     *affinity = CursorAffinity::Forward;
@@ -717,7 +717,6 @@ impl Document {
                 (new_offset, None)
             }
             Movement::Up => {
-                println!("Move up");
                 let font_size = config.editor.font_size;
 
                 let line = self.lines.visual_line_of_offset(
@@ -725,28 +724,21 @@ impl Document {
                     offset,
                     *affinity,
                 );
-                println!("\tLine: {line:?}");
                 if line.get() == 0 {
                     let new_offset =
                         self.lines.offset_of_visual_line(&self.buffer.text(), line);
-                    // TODO: correct affinity?
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
                             self.line_point_of_offset(offset, *affinity, font_size)
                                 .x,
                         )
                     });
-                    println!("\tnew_offset: {new_offset:?} horiz: {horiz:?}");
 
                     return (new_offset, Some(horiz));
                 }
 
                 let line = VisualLine(line.get().saturating_sub(count));
-                let Some(line_info) = self.visual_line_entry(line) else {
-                    // Should this just assume that the col it got was zero, and thus the new offset it got was also 0? or would it be at the end?
-                    todo!()
-                };
-                println!("\tnew line: {line:?}; line_info: {line_info:?}");
+                let line_info = self.visual_line_entry(line);
 
                 // TODO: is this the correct affinity?
                 let horiz = horiz.cloned().unwrap_or_else(|| {
@@ -766,23 +758,15 @@ impl Document {
                     CursorAffinity::Backward
                 };
                 let new_offset = self.offset_of_visual_line_col(line_info, col);
-                println!(
-                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?} mode {mode:?}"
-                );
                 (new_offset, Some(horiz))
             }
             Movement::Down => {
                 let font_size = config.editor.font_size;
 
-                println!("Move down");
                 let line = self.visual_line_of_offset(offset, *affinity);
-                println!("\tLine: {line:?} horiz: {horiz:?} affinity: {affinity:?}");
-                // TODO: don't unwrap
-                let line_info = self.visual_line_entry(line).unwrap();
-                let next_line = VisualLine(line.get() + 1);
-                if self.visual_line_entry(next_line).is_none() {
-                    // TODO: is this the right way to implement this?
-                    // We assume this implies that line is the last line
+                let line_info = self.visual_line_entry(line);
+                let last_vline_info = self.last_visual_line_entry();
+                if line_info == last_vline_info {
                     let new_offset = line_info
                         .line_end_offset(&self.buffer.text(), mode != Mode::Normal);
                     let horiz = horiz.cloned().unwrap_or_else(|| {
@@ -792,16 +776,11 @@ impl Document {
                         )
                     });
 
-                    println!("\tnew_offset: {new_offset:?} horiz: {horiz:?}");
                     return (new_offset, Some(horiz));
                 }
 
                 let line = VisualLine(line.get() + count);
-                let line_info = self
-                    .visual_line_entry(line)
-                    .unwrap_or_else(|| self.last_visual_line_entry());
-
-                println!("\tnew line: {line:?}; line_info: {line_info:?}");
+                let line_info = self.visual_line_entry(line);
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(
@@ -827,9 +806,6 @@ impl Document {
 
                 let new_offset = self.offset_of_visual_line_col(line_info, col);
 
-                println!(
-                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?} mode {mode:?}"
-                );
                 (new_offset, Some(horiz))
             }
             Movement::DocumentStart => {
@@ -846,9 +822,7 @@ impl Document {
             }
             Movement::FirstNonBlank => {
                 let line = self.visual_line_of_offset(offset, *affinity);
-                let line_info = self
-                    .visual_line_entry(line)
-                    .unwrap_or_else(|| self.last_visual_line_entry());
+                let line_info = self.visual_line_entry(line);
                 let non_blank_offset =
                     line_info.first_non_blank_character(&self.buffer.text());
                 let start_line_offset = line_info.interval.start;
@@ -876,9 +850,7 @@ impl Document {
             }
             Movement::EndOfLine => {
                 let line = self.visual_line_of_offset(offset, *affinity);
-                let line_info = self
-                    .visual_line_entry(line)
-                    .unwrap_or_else(|| self.last_visual_line_entry());
+                let line_info = self.visual_line_entry(line);
                 let new_col =
                     line_info.last_col(&self.buffer.text(), mode != Mode::Normal);
                 if new_col == 0 {
@@ -901,9 +873,7 @@ impl Document {
                     self.buffer.offset_of_line(line),
                     CursorAffinity::Backward,
                 );
-                let line_info = self
-                    .visual_line_entry(line)
-                    .unwrap_or_else(|| self.last_visual_line_entry());
+                let line_info = self.visual_line_entry(line);
 
                 let font_size = config.editor.font_size;
                 // TODO: is this the right affinity?
@@ -1098,12 +1068,8 @@ impl Document {
         font_size: usize,
     ) -> Point {
         let (line, col) = self.visual_line_col_of_offset(offset, affinity);
-        if let Some(line) = self.visual_line_entry(line) {
-            self.line_point_of_line_col(line, col, font_size)
-        } else {
-            // TODO: is this a reasonable default?
-            Point::new(0.0, 0.0)
-        }
+        let line_info = self.visual_line_entry(line);
+        self.line_point_of_line_col(line_info, col, font_size)
     }
 
     /// Returns the point into the text layout of the line at the given line and column.
@@ -1130,12 +1096,8 @@ impl Document {
             offset,
             affinity,
         );
-        if let Some(line) = self.visual_line_entry(line) {
-            self.points_of_line_col(line, col)
-        } else {
-            // TODO: by default points_of_line_col saturates to last line, but we can't easily default to that anymore
-            todo!()
-        }
+        let line_info = self.visual_line_entry(line);
+        self.points_of_line_col(line_info, col)
     }
 
     /// Get the (point above, point below) of a particular (line, col) within the editor.
@@ -1366,9 +1328,8 @@ impl Document {
         line: VisualLine,
         font_size: usize,
     ) -> Arc<TextLayoutLine> {
-        // TODO: should we be unwrapping?
-        let line = self.visual_line_entry(line).unwrap();
-        self.get_text_layout(line, font_size)
+        let line_info = self.visual_line_entry(line);
+        self.get_text_layout(line_info, font_size)
     }
 
     /// Get the text layout for the given [`VisualLineEntry`]
@@ -1567,7 +1528,6 @@ impl Document {
 
     /// Get the phantom text for a given line
     pub fn line_phantom_text(&self, line: VisualLineEntry) -> PhantomTextLine {
-        println!("line_phantom_text line_info={line:?}");
         let config = self.config.get_untracked();
 
         // let start_offset = self.buffer.offset_of_line(line);
@@ -1651,8 +1611,6 @@ impl Document {
                 }
             })
             .map(|diag| {
-                println!("Diag for line {:?} of {}", line.vline, line.line);
-                let is_last = line.is_last(self.buffer.text());
                 match (diag.diagnostic.severity, max_severity) {
                     (Some(severity), Some(max)) => {
                         if severity < max {
@@ -1665,9 +1623,6 @@ impl Document {
                     _ => {}
                 }
 
-                // let rope_text = self.buffer.rope_text();
-                // let col = rope_text.offset_of_line(line + 1)
-                //     - rope_text.offset_of_line(line);
                 let col = line.last_col(self.buffer.text(), true);
                 let fg = {
                     let severity = diag

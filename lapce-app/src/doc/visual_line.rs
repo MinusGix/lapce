@@ -58,7 +58,7 @@ impl VisualLine {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisualLineEntry {
     pub interval: Interval,
     /// The buffer line number for this line.
@@ -88,10 +88,6 @@ impl VisualLineEntry {
         let rtext = RopeText::new(text);
         let line_end = rtext.line_end_offset(self.line, false);
         let vline_end = self.line_end_offset(text, false);
-        println!(
-            "\tline={}; vline={:?}; line_end={} ==? vline_end={}",
-            self.line, self.vline, line_end, vline_end
-        );
         line_end == vline_end
     }
 
@@ -225,16 +221,13 @@ impl Lines {
     /// previous line or the next line.  
     /// If `affinity` is `CursorAffinity::Forward` and is at the very end of the wrapped line, then
     /// the offset is considered to be on the next line.
-    ///
-    /// # Panics
-    /// Panics of `offset > text.len()`
     pub fn visual_line_of_offset(
         &self,
         text: &Rope,
         offset: usize,
         affinity: CursorAffinity,
     ) -> VisualLine {
-        println!("=== Offset: {offset}; text len: {}", text.len());
+        let offset = offset.min(text.len());
         let mut line = text.line_of_offset(offset);
         if self.wrap != WrapStyle::None {
             line += self.breaks.count::<BreaksMetric>(offset);
@@ -330,7 +323,6 @@ impl Lines {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(start_line);
         let buffer_line = text.line_of_offset(offset);
-        println!("Start line: {start_line:?}; offset: {offset}; buffer_line: {buffer_line}");
         cursor.set_offset(offset);
         VisualLines {
             offset,
