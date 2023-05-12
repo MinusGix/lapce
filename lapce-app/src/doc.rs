@@ -49,7 +49,7 @@ use crate::{
 
 use self::{
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
-    visual_line::{Lines, VisualLine, VisualLineEntry},
+    visual_line::{Lines, VisualLine, VisualLineInfo},
     width_calc::BasicWidthCalc,
 };
 
@@ -202,7 +202,7 @@ pub struct Document {
 pub struct DocLine {
     pub rev: u64,
     pub style_rev: u64,
-    pub line_info: VisualLineEntry,
+    pub line_info: VisualLineInfo,
     pub text: Arc<TextLayoutLine>,
 }
 
@@ -210,6 +210,7 @@ impl VirtualListVector<DocLine> for Document {
     type ItemIterator = std::vec::IntoIter<DocLine>;
 
     fn total_len(&self) -> usize {
+        // TODO(minor): does this need to be cached?
         self.lines.last_visual_line(&self.buffer.text()).vline.get() + 1
     }
 
@@ -519,36 +520,40 @@ impl Document {
         self.code_actions.clear();
     }
 
-    pub fn visual_line_entry(&self, line: VisualLine) -> VisualLineEntry {
+    pub fn visual_line_info(&self, line: VisualLine) -> VisualLineInfo {
         self.lines
             .iter_lines(&self.buffer.text(), line)
             .next()
-            .unwrap_or_else(|| self.last_visual_line_entry())
+            .unwrap_or_else(|| self.last_visual_line_info())
     }
 
-    pub fn last_visual_line_entry(&self) -> VisualLineEntry {
+    /// The [`VisualLineInfo`] of the last line in the display.  
+    /// Note that if the wrapping has not yet been completed for the last line, this
+    /// will unwrapped results.
+    pub fn last_visual_line_info(&self) -> VisualLineInfo {
         self.lines.last_visual_line(&self.buffer.text())
     }
 
     // TODO: we could just have a trait for 'treat this as a rope' and implement it for ropes and document, so then this can purely be a method on VisualLineEntry, passing in the doc/rope. This would also avoid other repetitive functions.
-    pub fn last_col(&self, line: VisualLineEntry, caret: bool) -> usize {
+    pub fn last_col(&self, line: VisualLineInfo, caret: bool) -> usize {
         line.last_col(&self.buffer.text(), caret)
     }
 
     pub fn iter_visual_lines<'a>(
         &'a self,
         start_line: VisualLine,
-    ) -> impl Iterator<Item = VisualLineEntry> + 'a {
+    ) -> impl Iterator<Item = VisualLineInfo> + 'a {
         self.lines.iter_lines(&self.buffer.text(), start_line)
     }
 
-    pub fn offset_of_visual_line(&self, line: VisualLine) -> usize {
-        self.lines.offset_of_visual_line(&self.buffer.text(), line)
+    pub fn offset_of_visual_line(&self, line_info: VisualLine) -> usize {
+        self.lines
+            .offset_of_visual_line(&self.buffer.text(), line_info)
     }
 
     pub fn offset_of_visual_line_col(
         &self,
-        line_info: VisualLineEntry,
+        line_info: VisualLineInfo,
         col: usize,
     ) -> usize {
         self.lines
@@ -575,23 +580,23 @@ impl Document {
 
     pub fn line_horiz_col(
         &self,
-        line: VisualLineEntry,
+        line_info: VisualLineInfo,
         font_size: usize,
         horiz: &ColPosition,
         caret: bool,
     ) -> usize {
         match *horiz {
             ColPosition::Col(x) => {
-                let text_layout = self.get_text_layout(line, font_size);
+                let text_layout = self.get_text_layout(line_info, font_size);
                 let hit_point = text_layout.text.hit_point(Point::new(x, 0.0));
                 let n = hit_point.index;
 
-                n.min(self.last_col(line, caret))
+                n.min(self.last_col(line_info, caret))
             }
-            ColPosition::End => self.last_col(line, caret),
+            ColPosition::End => self.last_col(line_info, caret),
             ColPosition::Start => 0,
             ColPosition::FirstNonBlank => {
-                line.first_non_blank_character(&self.buffer.text())
+                line_info.first_non_blank_character(&self.buffer.text())
             }
         }
     }
@@ -706,7 +711,7 @@ impl Document {
                 }
 
                 let (line, col) = self.visual_line_col_of_offset(offset, *affinity);
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
 
                 if col == line_info.last_col(self.buffer.text(), true) {
                     *affinity = CursorAffinity::Forward;
@@ -738,7 +743,7 @@ impl Document {
                 }
 
                 let line = VisualLine(line.get().saturating_sub(count));
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
 
                 // TODO: is this the correct affinity?
                 let horiz = horiz.cloned().unwrap_or_else(|| {
@@ -764,8 +769,8 @@ impl Document {
                 let font_size = config.editor.font_size;
 
                 let line = self.visual_line_of_offset(offset, *affinity);
-                let line_info = self.visual_line_entry(line);
-                let last_vline_info = self.last_visual_line_entry();
+                let line_info = self.visual_line_info(line);
+                let last_vline_info = self.last_visual_line_info();
                 if line_info == last_vline_info {
                     let new_offset = line_info
                         .line_end_offset(&self.buffer.text(), mode != Mode::Normal);
@@ -780,7 +785,7 @@ impl Document {
                 }
 
                 let line = VisualLine(line.get() + count);
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
                     ColPosition::Col(
@@ -822,7 +827,7 @@ impl Document {
             }
             Movement::FirstNonBlank => {
                 let line = self.visual_line_of_offset(offset, *affinity);
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
                 let non_blank_offset =
                     line_info.first_non_blank_character(&self.buffer.text());
                 let start_line_offset = line_info.interval.start;
@@ -850,7 +855,7 @@ impl Document {
             }
             Movement::EndOfLine => {
                 let line = self.visual_line_of_offset(offset, *affinity);
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
                 let new_col =
                     line_info.last_col(&self.buffer.text(), mode != Mode::Normal);
                 if new_col == 0 {
@@ -873,7 +878,7 @@ impl Document {
                     self.buffer.offset_of_line(line),
                     CursorAffinity::Backward,
                 );
-                let line_info = self.visual_line_entry(line);
+                let line_info = self.visual_line_info(line);
 
                 let font_size = config.editor.font_size;
                 // TODO: is this the right affinity?
@@ -1068,7 +1073,7 @@ impl Document {
         font_size: usize,
     ) -> Point {
         let (line, col) = self.visual_line_col_of_offset(offset, affinity);
-        let line_info = self.visual_line_entry(line);
+        let line_info = self.visual_line_info(line);
         self.line_point_of_line_col(line_info, col, font_size)
     }
 
@@ -1076,7 +1081,7 @@ impl Document {
     /// `x` being the leading edge of the character, and `y` being the baseline.
     pub fn line_point_of_line_col(
         &self,
-        line: VisualLineEntry,
+        line: VisualLineInfo,
         col: usize,
         font_size: usize,
     ) -> Point {
@@ -1096,14 +1101,14 @@ impl Document {
             offset,
             affinity,
         );
-        let line_info = self.visual_line_entry(line);
+        let line_info = self.visual_line_info(line);
         self.points_of_line_col(line_info, col)
     }
 
     /// Get the (point above, point below) of a particular (line, col) within the editor.
     pub fn points_of_line_col(
         &self,
-        line: VisualLineEntry,
+        line: VisualLineInfo,
         col: usize,
     ) -> (Point, Point) {
         let config = self.config.get_untracked();
@@ -1150,7 +1155,7 @@ impl Document {
 
     fn new_text_layout(
         &self,
-        line: VisualLineEntry,
+        line: VisualLineInfo,
         _font_size: usize,
     ) -> TextLayoutLine {
         let config = self.config.get_untracked();
@@ -1328,15 +1333,15 @@ impl Document {
         line: VisualLine,
         font_size: usize,
     ) -> Arc<TextLayoutLine> {
-        let line_info = self.visual_line_entry(line);
+        let line_info = self.visual_line_info(line);
         self.get_text_layout(line_info, font_size)
     }
 
-    /// Get the text layout for the given [`VisualLineEntry`]
+    /// Get the text layout for the given [`VisualLineInfo`]
     /// If the text layout is not cached, it will be created and cached.
     pub fn get_text_layout(
         &self,
-        line: VisualLineEntry,
+        line_info: VisualLineInfo,
         font_size: usize,
     ) -> Arc<TextLayoutLine> {
         let config = self.config.get_untracked();
@@ -1356,11 +1361,11 @@ impl Document {
             .layouts
             .get(&font_size)
             .unwrap()
-            .get(&line.vline)
+            .get(&line_info.vline)
             .is_some();
         // If there isn't an entry then we actually have to create it
         if !cache_exists {
-            let text_layout = Arc::new(self.new_text_layout(line, font_size));
+            let text_layout = Arc::new(self.new_text_layout(line_info, font_size));
             let mut cache = self.text_layouts.borrow_mut();
             let width = text_layout.text.size().width;
             if width > cache.max_width {
@@ -1370,7 +1375,7 @@ impl Document {
                 .layouts
                 .get_mut(&font_size)
                 .unwrap()
-                .insert(line.vline, text_layout);
+                .insert(line_info.vline, text_layout);
         }
 
         // Just get the entry, assuming it has been created because we initialize it above.
@@ -1379,7 +1384,7 @@ impl Document {
             .layouts
             .get(&font_size)
             .unwrap()
-            .get(&line.vline)
+            .get(&line_info.vline)
             .cloned()
             .unwrap()
     }
@@ -1527,7 +1532,7 @@ impl Document {
     }
 
     /// Get the phantom text for a given line
-    pub fn line_phantom_text(&self, line: VisualLineEntry) -> PhantomTextLine {
+    pub fn line_phantom_text(&self, line: VisualLineInfo) -> PhantomTextLine {
         let config = self.config.get_untracked();
 
         // let start_offset = self.buffer.offset_of_line(line);
@@ -1549,7 +1554,7 @@ impl Document {
                 interval.start >= start_offset && interval.start < end_offset
             })
             .map(|(interval, inlay_hint)| {
-                // TODO(minor): we could probably compute this more efficiently because we already have the relevant line_info
+                // TODO(minor): This could probalby skip some of the calculation since we know which visual line info it is on!
                 let (_, col) = self.visual_line_col_of_offset(
                     interval.start,
                     CursorAffinity::Backward,

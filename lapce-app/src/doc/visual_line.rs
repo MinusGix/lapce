@@ -1,4 +1,6 @@
-// This is based on xi-editor's line-wrap logic
+//! Implements line wrapping logic, and dealing with visual lines.  
+//!   
+//! This is a modified version of [Xi-editor's line wrapping logic](https://github.com/xi-editor/xi-editor/blob/ec9bf9161cf8579e3c80f1c336f6482a6c0c66d9/rust/core-lib/src/linewrap.rs).
 
 use std::{borrow::Cow, cmp::Ordering, ops::Range};
 
@@ -58,8 +60,13 @@ impl VisualLine {
     }
 }
 
+/// Information about the visual line, giving the interval in the buffer that it covers, and other
+/// data.  
+/// This should *not* be constructed directly, but acquired from functions like
+/// [`Document::visual_line_info`], or [`Lines::iter_lines`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VisualLineEntry {
+pub struct VisualLineInfo {
+    /// Start offset to end offset in the buffer.
     pub interval: Interval,
     /// The buffer line number for this line.
     pub line: usize,
@@ -67,19 +74,22 @@ pub struct VisualLineEntry {
     /// Used for deciding whether to render the line number.
     pub is_first: bool,
     pub vline: VisualLine,
+    // Make so that the struct is not constructable outside of this module.
+    _marker: (),
 }
-impl VisualLineEntry {
+impl VisualLineInfo {
     fn new<I: Into<Interval>>(
         iv: I,
         line: usize,
         is_first: bool,
         vline: VisualLine,
     ) -> Self {
-        VisualLineEntry {
+        VisualLineInfo {
             interval: iv.into(),
             line,
             is_first,
             vline,
+            _marker: (),
         }
     }
 
@@ -91,6 +101,7 @@ impl VisualLineEntry {
         line_end == vline_end
     }
 
+    /// Get the last column of the visual line.
     pub fn last_col(&self, text: &Rope, caret: bool) -> usize {
         let line_start = self.interval.start;
         let end_offset = self.line_end_offset(text, caret);
@@ -193,7 +204,6 @@ impl Lines {
                     self.work.push(new);
                     self.work.push(*work);
                 }
-                // TODO: minor but we could stop whenever new_task is None and just use something like vec extend, which would be slightly faster
                 // There's no new_task, so we just push the work
                 None => self.work.push(*work),
             }
@@ -215,8 +225,6 @@ impl Lines {
     }
 
     // TODO: add tests for affinity behavior
-    // TODO: if we, in practice, always set caret_breaks to false we should just remove it and use that as the default
-    // TODO: does xi-editor have the issue of it being on the wrong line? How do they manage the cursor?
     /// `affinity` decides whether an offset at a soft line break is considered to be on the
     /// previous line or the next line.  
     /// If `affinity` is `CursorAffinity::Forward` and is at the very end of the wrapped line, then
@@ -249,7 +257,10 @@ impl Lines {
     ) -> (VisualLine, usize) {
         // TODO: this is probably doing extra unneeded work
         let line = self.visual_line_of_offset(text, offset, affinity);
-        let line_info = self.iter_lines(text, line).next().unwrap();
+        let line_info = self
+            .iter_lines(text, line)
+            .next()
+            .unwrap_or_else(|| self.last_visual_line(text));
         let line_offset = self.offset_of_visual_line(text, line);
 
         let col = offset - line_offset;
@@ -275,16 +286,12 @@ impl Lines {
     pub fn offset_of_visual_line_col(
         &self,
         text: &Rope,
-        line_info: VisualLineEntry,
+        line_info: VisualLineInfo,
         col: usize,
     ) -> usize {
         // TODO: this is the same logic as ropetexts offset of line col. We could generalize that to an interval so we don't rewrite it here.
-        // // TODO: buffer offset_of_line_col does more intricate logic!
-        // let line_offset = self.offset_of_visual_line(text, line);
-        // line_offset + col
 
         let mut pos = 0;
-        // let mut offset = self.offset_of_visual_line(text, line);
 
         let mut offset = line_info.interval.start;
         for c in text.slice_to_cow(line_info.interval).chars() {
@@ -302,24 +309,26 @@ impl Lines {
         offset
     }
 
-    pub fn last_visual_line(&self, text: &Rope) -> VisualLineEntry {
+    pub fn last_visual_line(&self, text: &Rope) -> VisualLineInfo {
         // TODO: we may be able to skip ahead more efficiently?
+        // TODO: can this ever actually be empty?
         self.iter_lines(text, VisualLine(0))
             .last()
-            .unwrap_or(VisualLineEntry {
-                interval: Interval::new(0, 0),
-                line: 0,
-                is_first: true,
-                vline: VisualLine(0),
-            })
+            // Otherwise we forge a line
+            .unwrap_or(VisualLineInfo::new(
+                Interval::new(0, 0),
+                0,
+                true,
+                VisualLine(0),
+            ))
     }
 
-    /// Iterator over [`VisualLineEntry`]s, starting at `start_line`
+    /// Iterator over [`VisualLineInfo`]s, starting at `start_line`
     pub fn iter_lines<'a>(
         &'a self,
         text: &'a Rope,
         start_line: VisualLine,
-    ) -> impl Iterator<Item = VisualLineEntry> + 'a {
+    ) -> impl Iterator<Item = VisualLineInfo> + 'a {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(start_line);
         let buffer_line = text.line_of_offset(offset);
@@ -335,15 +344,15 @@ impl Lines {
         }
     }
 
-    /// Iterator over [`VisualLineEntry`]s in the range `start_line..end_line`
+    /// Iterator over [`VisualLineInfo`]s in the range `start_line..end_line`
     pub fn iter_lines_over<'a>(
         &'a self,
         text: &'a Rope,
         start_line: VisualLine,
         end_line: VisualLine,
-    ) -> impl Iterator<Item = VisualLineEntry> + 'a {
+    ) -> impl Iterator<Item = VisualLineInfo> + 'a {
         self.iter_lines(text, start_line)
-            .take_while(move |entry| entry.vline < end_line)
+            .take_while(move |info| info.vline < end_line)
     }
 
     /// Returns the next task, prioritizing the currently visible region.  
@@ -792,6 +801,7 @@ impl<'a> LineBreakCursor<'a> {
     }
 }
 
+/// Iterator over the visual lines in the file, producing [`VisualLineInfo`] entries.
 struct VisualLines<'a> {
     cursor: MergedBreaks<'a>,
     offset: usize,
@@ -803,14 +813,18 @@ struct VisualLines<'a> {
 }
 
 impl<'a> Iterator for VisualLines<'a> {
-    type Item = VisualLineEntry;
+    type Item = VisualLineInfo;
 
-    fn next(&mut self) -> Option<VisualLineEntry> {
+    fn next(&mut self) -> Option<VisualLineInfo> {
         let is_first = self.cursor.is_hard_break();
+        // If we've found a hard line break, or this is the first iteration, then we add to
+        // the buffer line count.
         if is_first || self.is_first_iter {
             self.buffer_line += 1;
             self.is_first_iter = false;
         }
+        // We always subtract to ensure we're tracking the line properly, since one buffer line can
+        // map to multiple visual lines.
         let line_num = self.buffer_line.saturating_sub(1);
 
         let next_end_bound = match self.cursor.next() {
@@ -821,7 +835,7 @@ impl<'a> Iterator for VisualLines<'a> {
                 self.len
             }
         };
-        let result = VisualLineEntry::new(
+        let result = VisualLineInfo::new(
             self.offset..next_end_bound,
             line_num,
             is_first,
@@ -879,7 +893,6 @@ impl<'a> Iterator for MergedBreaks<'a> {
     }
 }
 
-// arrived at this by just trying out a bunch of values ¯\_(ツ)_/¯
 /// how far away a line can be before we switch to a binary search
 const MAX_LINEAR_DIST: usize = 20;
 

@@ -24,7 +24,7 @@ use lapce_core::{
 use crate::{
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     doc::{
-        visual_line::{VisualLine, VisualLineEntry},
+        visual_line::{VisualLine, VisualLineInfo},
         DocLine, Document, LineExtraStyle,
     },
     wave::wave_line,
@@ -37,17 +37,17 @@ use super::EditorData;
 #[derive(Clone, Debug)]
 enum CursorRender {
     CurrentLine {
-        line_info: VisualLineEntry,
+        line_info: VisualLineInfo,
     },
     Selection {
         x: f64,
         width: f64,
-        line_info: VisualLineEntry,
+        line_info: VisualLineInfo,
     },
     Caret {
         x: f64,
         width: f64,
-        line_info: VisualLineEntry,
+        line_info: VisualLineInfo,
     },
 }
 
@@ -58,7 +58,7 @@ fn cursor_caret(
     affinity: CursorAffinity,
 ) -> CursorRender {
     let (line, col) = doc.visual_line_col_of_offset(offset, affinity);
-    let line_info = doc.visual_line_entry(line);
+    let line_info = doc.visual_line_info(line);
     let phantom_text = doc.line_phantom_text(line_info);
     let col = phantom_text.col_after(col, block);
     let x0 = doc.line_point_of_line_col(line_info, col, 12).x;
@@ -595,7 +595,7 @@ fn editor_cursor(
             cursor.with(|cursor| match &cursor.mode {
                 CursorMode::Normal(offset) => {
                     let line = doc.visual_line_of_offset(*offset, cursor.affinity);
-                    let line_info = doc.visual_line_entry(line);
+                    let line_info = doc.visual_line_info(line);
                     let mut renders =
                         vec![(viewport, CursorRender::CurrentLine { line_info })];
                     if is_active {
