@@ -16,7 +16,7 @@ use floem::{
     AppContext,
 };
 use lapce_core::{
-    cursor::{ColPosition, Cursor, CursorMode},
+    cursor::{ColPosition, Cursor, CursorAffinity, CursorMode},
     mode::{Mode, VisualMode},
     selection::Selection,
 };
@@ -51,18 +51,24 @@ enum CursorRender {
     },
 }
 
-fn cursor_caret(doc: &Document, offset: usize, block: bool) -> CursorRender {
+fn cursor_caret(
+    doc: &Document,
+    offset: usize,
+    block: bool,
+    affinity: CursorAffinity,
+) -> CursorRender {
     // let (line, col) = doc.buffer().offset_to_line_col(offset);
-    let (line, col) = doc.visual_line_col_of_offset(offset);
+    let (line, col) = doc.visual_line_col_of_offset(offset, affinity);
     // TODO: don't unwrap
     let line_info = doc.visual_line_entry(line).unwrap();
-    let phantom_text = doc.line_phantom_text2(line_info);
+    // println!("cursor_caret line={line_info:?}; col: {col}; affinity: {affinity:?} block: {block}");
+    let phantom_text = doc.line_phantom_text(line_info);
     let col = phantom_text.col_after(col, block);
     let x0 = doc.line_point_of_line_col(line_info, col, 12).x;
     if block {
         let right_offset = doc.buffer().move_right(offset, Mode::Insert, 1);
         // let (_, right_col) = doc.buffer().offset_to_line_col(right_offset);
-        let (_, right_col) = doc.visual_line_col_of_offset(right_offset);
+        let (_, right_col) = doc.visual_line_col_of_offset(right_offset, affinity);
         let x1 = doc.line_point_of_line_col(line_info, right_col, 12).x;
 
         let width = if x1 > x0 { x1 - x0 } else { 7.0 };
@@ -85,6 +91,7 @@ fn visual_cursor(
     doc: &Document,
     start: usize,
     end: usize,
+    affinity: CursorAffinity,
     mode: &VisualMode,
     horiz: Option<&ColPosition>,
     min_line: VisualLine,
@@ -92,12 +99,11 @@ fn visual_cursor(
     char_width: f64,
     is_active: bool,
 ) -> Vec<CursorRender> {
-    // let (start_line, start_col) = doc.buffer().offset_to_line_col(start.min(end));
-    // let (end_line, end_col) = doc.buffer().offset_to_line_col(start.max(end));
-    // let (cursor_line, _) = doc.buffer().offset_to_line_col(end);
-    let (start_line, start_col) = doc.visual_line_col_of_offset(start.min(end));
-    let (end_line, end_col) = doc.visual_line_col_of_offset(start.max(end));
-    let cursor_line = doc.visual_line_of_offset(end);
+    let (start_line, start_col) =
+        doc.visual_line_col_of_offset(start.min(end), affinity);
+    let (end_line, end_col) =
+        doc.visual_line_col_of_offset(start.max(end), affinity);
+    let cursor_line = doc.visual_line_of_offset(end, affinity);
 
     let mut renders = Vec::new();
 
@@ -142,7 +148,8 @@ fn visual_cursor(
 
                     let end_offset =
                         doc.buffer().move_right(start.max(end), Mode::Visual, 1);
-                    let (_, end_col) = doc.visual_line_col_of_offset(end_offset);
+                    let (_, end_col) =
+                        doc.visual_line_col_of_offset(end_offset, affinity);
 
                     (end_col.min(max_col), false)
                 } else {
@@ -157,7 +164,8 @@ fn visual_cursor(
                     _ => {
                         let end_offset =
                             doc.buffer().move_right(start.max(end), Mode::Visual, 1);
-                        let (_, end_col) = doc.visual_line_col_of_offset(end_offset);
+                        let (_, end_col) =
+                            doc.visual_line_col_of_offset(end_offset, affinity);
                         end_col.max(start_col).min(max_col)
                     }
                 };
@@ -165,7 +173,7 @@ fn visual_cursor(
             }
         };
 
-        let phantom_text = doc.line_phantom_text2(line_info);
+        let phantom_text = doc.line_phantom_text(line_info);
         let left_col = phantom_text.col_after(left_col, false);
         let right_col = phantom_text.col_after(right_col, false);
         let x0 = doc.line_point_of_line_col(line_info, left_col, 12).x;
@@ -181,7 +189,7 @@ fn visual_cursor(
         });
 
         if is_active && line == cursor_line {
-            let caret = cursor_caret(doc, end, true);
+            let caret = cursor_caret(doc, end, true, affinity);
             renders.push(caret);
         }
     }
@@ -191,6 +199,7 @@ fn visual_cursor(
 
 fn insert_cursor(
     doc: &Document,
+    affinity: CursorAffinity,
     selection: &Selection,
     min_line: VisualLine,
     max_line: VisualLine,
@@ -208,14 +217,16 @@ fn insert_cursor(
     for region in regions {
         let cursor_offset = region.end;
         // let (cursor_line, _) = doc.buffer().offset_to_line_col(cursor_offset);
-        let cursor_line = doc.visual_line_of_offset(cursor_offset);
+        let cursor_line = doc.visual_line_of_offset(cursor_offset, affinity);
         let start = region.start;
         let end = region.end;
         // let (start_line, start_col) =
         //     doc.buffer().offset_to_line_col(start.min(end));
         // let (end_line, end_col) = doc.buffer().offset_to_line_col(start.max(end));
-        let (start_line, start_col) = doc.visual_line_col_of_offset(start.min(end));
-        let (end_line, end_col) = doc.visual_line_col_of_offset(start.max(end));
+        let (start_line, start_col) =
+            doc.visual_line_col_of_offset(start.min(end), affinity);
+        let (end_line, end_col) =
+            doc.visual_line_col_of_offset(start.max(end), affinity);
         for line_info in doc.iter_visual_lines(min_line) {
             let line = line_info.vline;
             if line > max_line {
@@ -243,7 +254,7 @@ fn insert_cursor(
             };
 
             // Shift it by the inlay hints
-            let phantom_text = doc.line_phantom_text2(line_info);
+            let phantom_text = doc.line_phantom_text(line_info);
             let left_col = phantom_text.col_after(left_col, false);
             let right_col = phantom_text.col_after(right_col, false);
 
@@ -266,7 +277,7 @@ fn insert_cursor(
             }
 
             if is_active && line == cursor_line {
-                let caret = cursor_caret(doc, cursor_offset, false);
+                let caret = cursor_caret(doc, cursor_offset, false, affinity);
                 renders.push(caret);
             }
         }
@@ -339,9 +350,10 @@ fn editor_gutter(
     let code_action_line = create_memo(cx.scope, move |_| {
         if is_active() {
             let doc = editor.with(|editor| editor.doc);
-            let offset = cursor.with(|cursor| cursor.offset());
+            let (offset, affinity) =
+                cursor.with(|cursor| (cursor.offset(), cursor.affinity));
             doc.with(|doc| {
-                let line = doc.visual_line_of_offset(offset);
+                let line = doc.visual_line_of_offset(offset, affinity);
                 // let line = doc.buffer().line_of_offset(offset);
                 let has_code_actions = doc
                     .code_actions
@@ -588,30 +600,45 @@ fn editor_cursor(
             cursor.with(|cursor| match &cursor.mode {
                 CursorMode::Normal(offset) => {
                     // let line = doc.buffer().line_of_offset(*offset);
-                    let line = doc.visual_line_of_offset(*offset);
+                    let line = doc.visual_line_of_offset(*offset, cursor.affinity);
                     // TODO: don't unwrap?
                     let line_info = doc.visual_line_entry(line).unwrap();
                     let mut renders =
                         vec![(viewport, CursorRender::CurrentLine { line_info })];
                     if is_active {
-                        let caret = cursor_caret(doc, *offset, true);
+                        let caret =
+                            cursor_caret(doc, *offset, true, cursor.affinity);
                         renders.push((viewport, caret));
                     }
                     renders
                 }
                 CursorMode::Visual { start, end, mode } => visual_cursor(
-                    doc, *start, *end, mode, None, min_line, max_line, 7.5,
+                    doc,
+                    *start,
+                    *end,
+                    cursor.affinity,
+                    mode,
+                    None,
+                    min_line,
+                    max_line,
+                    7.5,
                     is_active,
                 )
                 .into_iter()
                 .map(|render| (viewport, render))
                 .collect(),
-                CursorMode::Insert(selection) => {
-                    insert_cursor(doc, selection, min_line, max_line, 7.5, is_active)
-                        .into_iter()
-                        .map(|render| (viewport, render))
-                        .collect()
-                }
+                CursorMode::Insert(selection) => insert_cursor(
+                    doc,
+                    cursor.affinity,
+                    selection,
+                    min_line,
+                    max_line,
+                    7.5,
+                    is_active,
+                )
+                .into_iter()
+                .map(|render| (viewport, render))
+                .collect(),
             })
         })
     };
@@ -853,8 +880,9 @@ fn editor_content(cx: AppContext, editor: RwSignal<EditorData>) -> impl View {
         let offset = cursor.offset();
         let editor = editor.get_untracked();
         let doc = editor.doc;
-        let caret =
-            doc.with_untracked(|doc| cursor_caret(doc, offset, !cursor.is_insert()));
+        let caret = doc.with_untracked(|doc| {
+            cursor_caret(doc, offset, !cursor.is_insert(), cursor.affinity)
+        });
         let config = config.get_untracked();
         let line_height = config.editor.line_height();
         if let CursorRender::Caret {

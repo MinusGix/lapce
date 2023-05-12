@@ -13,7 +13,7 @@ use floem::{
 use lapce_core::{
     buffer::InvalLines,
     command::{EditCommand, FocusCommand},
-    cursor::{Cursor, CursorMode},
+    cursor::{Cursor, CursorAffinity, CursorMode},
     editor::EditType,
     mode::Mode,
     movement::Movement,
@@ -149,6 +149,8 @@ impl EditorData {
             },
             None,
             None,
+            // TODO: is this the right affinity?
+            CursorAffinity::Backward,
         );
         let cursor = create_rw_signal(cx, cursor);
         let scroll_delta = create_rw_signal(cx, Vec2::ZERO);
@@ -1282,10 +1284,21 @@ impl EditorData {
             .doc
             .with_untracked(|doc| position.to_offset(doc.buffer()));
         let config = self.common.config.get_untracked();
+        // TODO: are these the right affinities?
         self.cursor.set(if config.core.modal {
-            Cursor::new(CursorMode::Normal(offset), None, None)
+            Cursor::new(
+                CursorMode::Normal(offset),
+                None,
+                None,
+                CursorAffinity::Forward,
+            )
         } else {
-            Cursor::new(CursorMode::Insert(Selection::caret(offset)), None, None)
+            Cursor::new(
+                CursorMode::Insert(Selection::caret(offset)),
+                None,
+                None,
+                CursorAffinity::Forward,
+            )
         });
         if let Some(scroll_offset) = scroll_offset {
             self.scroll_to.set(Some(scroll_offset));

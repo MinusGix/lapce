@@ -15,7 +15,7 @@ use lapce_core::{
     buffer::{Buffer, InvalLines},
     char_buffer::CharBuffer,
     command::EditCommand,
-    cursor::{ColPosition, Cursor, CursorMode},
+    cursor::{ColPosition, Cursor, CursorAffinity, CursorMode},
     editor::{EditType, Editor},
     mode::Mode,
     movement::{LinePosition, Movement},
@@ -83,6 +83,7 @@ pub struct DiagnosticData {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorDiagnostic {
+    /// (start offset, end offset)
     pub range: (usize, usize),
     pub diagnostic: Diagnostic,
 }
@@ -518,6 +519,7 @@ impl Document {
         self.code_actions.clear();
     }
 
+    // TODO: should this just default to the last visual line entry if `None`?
     pub fn visual_line_entry(&self, line: VisualLine) -> Option<VisualLineEntry> {
         self.lines.iter_lines(&self.buffer.text(), line).next()
     }
@@ -542,14 +544,31 @@ impl Document {
         self.lines.offset_of_visual_line(&self.buffer.text(), line)
     }
 
-    pub fn visual_line_of_offset(&self, offset: usize) -> VisualLine {
+    pub fn offset_of_visual_line_col(
+        &self,
+        line_info: VisualLineEntry,
+        col: usize,
+    ) -> usize {
         self.lines
-            .visual_line_of_offset(&self.buffer.text(), offset)
+            .offset_of_visual_line_col(&self.buffer.text(), line_info, col)
     }
 
-    pub fn visual_line_col_of_offset(&self, offset: usize) -> (VisualLine, usize) {
+    pub fn visual_line_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> VisualLine {
         self.lines
-            .visual_line_col_of_offset(&self.buffer.text(), offset)
+            .visual_line_of_offset(&self.buffer.text(), offset, affinity)
+    }
+
+    pub fn visual_line_col_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> (VisualLine, usize) {
+        self.lines
+            .visual_line_col_of_offset(&self.buffer.text(), offset, affinity)
     }
 
     pub fn line_horiz_col(
@@ -581,6 +600,7 @@ impl Document {
     fn move_region(
         &self,
         region: &SelRegion,
+        affinity: &mut CursorAffinity,
         count: usize,
         modify: bool,
         movement: &Movement,
@@ -612,6 +632,7 @@ impl Document {
 
         let (end, horiz) = self.move_offset(
             region.end,
+            affinity,
             region.horiz.as_ref(),
             count,
             movement,
@@ -627,15 +648,18 @@ impl Document {
     pub fn move_selection(
         &self,
         selection: &Selection,
+        affinity: &mut CursorAffinity,
         count: usize,
         modify: bool,
         movement: &Movement,
         mode: Mode,
     ) -> Selection {
+        // TODO: this usage of affinity might not work completely right. Should it be per selection or something?
         let mut new_selection = Selection::new();
         for region in selection.regions() {
-            new_selection
-                .add_region(self.move_region(region, count, modify, movement, mode));
+            new_selection.add_region(
+                self.move_region(region, affinity, count, modify, movement, mode),
+            );
         }
         new_selection
     }
@@ -643,6 +667,7 @@ impl Document {
     pub fn move_offset(
         &self,
         offset: usize,
+        affinity: &mut CursorAffinity,
         horiz: Option<&ColPosition>,
         count: usize,
         movement: &Movement,
@@ -662,21 +687,12 @@ impl Document {
                     );
                 }
 
+                *affinity = CursorAffinity::Forward;
+
                 (new_offset, None)
             }
             Movement::Right => {
-                println!("Move right");
-                println!("\tOffset: {offset:?}; mode: {mode:?}; count: {count:?}");
-                println!(
-                    "\tPrev line col: {:?}",
-                    self.visual_line_col_of_offset(offset)
-                );
                 let mut new_offset = self.buffer.move_right(offset, mode, count);
-                println!("\tNew offset: {new_offset:?}");
-                println!(
-                    "\tNew line col: {:?}",
-                    self.visual_line_col_of_offset(new_offset)
-                );
 
                 if config.editor.atomic_soft_tabs && config.editor.tab_width > 1 {
                     new_offset = snap_to_soft_tab(
@@ -687,22 +703,37 @@ impl Document {
                     );
                 }
 
+                let (line, col) = self.visual_line_col_of_offset(offset, *affinity);
+                let line_info = self
+                    .visual_line_entry(line)
+                    .unwrap_or_else(|| self.last_visual_line_entry());
+
+                if col == line_info.last_col(self.buffer.text(), true) {
+                    *affinity = CursorAffinity::Forward;
+                } else {
+                    *affinity = CursorAffinity::Backward;
+                }
+
                 (new_offset, None)
             }
             Movement::Up => {
                 println!("Move up");
                 let font_size = config.editor.font_size;
 
-                let line = self
-                    .lines
-                    .visual_line_of_offset(&self.buffer.text(), offset);
+                let line = self.lines.visual_line_of_offset(
+                    &self.buffer.text(),
+                    offset,
+                    *affinity,
+                );
                 println!("\tLine: {line:?}");
                 if line.get() == 0 {
                     let new_offset =
                         self.lines.offset_of_visual_line(&self.buffer.text(), line);
+                    // TODO: correct affinity?
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
-                            self.line_point_of_offset(offset, font_size).x,
+                            self.line_point_of_offset(offset, *affinity, font_size)
+                                .x,
                         )
                     });
                     println!("\tnew_offset: {new_offset:?} horiz: {horiz:?}");
@@ -717,8 +748,11 @@ impl Document {
                 };
                 println!("\tnew line: {line:?}; line_info: {line_info:?}");
 
+                // TODO: is this the correct affinity?
                 let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
                 });
                 let col = self.line_horiz_col(
                     line_info,
@@ -726,51 +760,23 @@ impl Document {
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.lines.offset_of_visual_line_col(
-                    &self.buffer.text(),
-                    line,
-                    col,
-                );
+                *affinity = if col == 0 {
+                    CursorAffinity::Forward
+                } else {
+                    CursorAffinity::Backward
+                };
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
                 println!(
-                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?}"
+                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?} mode {mode:?}"
                 );
                 (new_offset, Some(horiz))
             }
             Movement::Down => {
                 let font_size = config.editor.font_size;
 
-                // let last_line = self.buffer.last_line();
-                // let line = self.buffer.line_of_offset(offset);
-                // if line == last_line {
-                // let new_offset =
-                //     self.buffer.offset_line_end(offset, mode != Mode::Normal);
-                //     let horiz = horiz.cloned().unwrap_or_else(|| {
-                //         ColPosition::Col(
-                //             self.line_point_of_offset(offset, font_size).x,
-                //         )
-                //     });
-                //     return (new_offset, Some(horiz));
-                // }
-
-                // let line = line + count;
-
-                // let line = line.min(last_line);
-
-                // let horiz = horiz.cloned().unwrap_or_else(|| {
-                //     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
-                // });
-                // let col = self.line_horiz_col(
-                //     line,
-                //     font_size,
-                //     &horiz,
-                //     mode != Mode::Normal,
-                // );
-                // let new_offset = self.buffer.offset_of_line_col(line, col);
-                // (new_offset, Some(horiz))
-
-                let line = self
-                    .lines
-                    .visual_line_of_offset(&self.buffer.text(), offset);
+                println!("Move down");
+                let line = self.visual_line_of_offset(offset, *affinity);
+                println!("\tLine: {line:?} horiz: {horiz:?} affinity: {affinity:?}");
                 // TODO: don't unwrap
                 let line_info = self.visual_line_entry(line).unwrap();
                 let next_line = VisualLine(line.get() + 1);
@@ -781,9 +787,12 @@ impl Document {
                         .line_end_offset(&self.buffer.text(), mode != Mode::Normal);
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
-                            self.line_point_of_offset(offset, font_size).x,
+                            self.line_point_of_offset(offset, *affinity, font_size)
+                                .x,
                         )
                     });
+
+                    println!("\tnew_offset: {new_offset:?} horiz: {horiz:?}");
                     return (new_offset, Some(horiz));
                 }
 
@@ -792,34 +801,59 @@ impl Document {
                     .visual_line_entry(line)
                     .unwrap_or_else(|| self.last_visual_line_entry());
 
+                println!("\tnew line: {line:?}; line_info: {line_info:?}");
+
                 let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
                 });
+
                 let col = self.line_horiz_col(
                     line_info,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.lines.offset_of_visual_line_col(
-                    &self.buffer.text(),
-                    line,
-                    col,
+                *affinity = if col == 0 {
+                    // the column was zero so we shift it to be at the line itself. This lets us
+                    // move down to an empty - for example - next line and appear at the start of
+                    // that line without it coinciding with the offset at the end of the previous
+                    // line
+                    CursorAffinity::Forward
+                } else {
+                    CursorAffinity::Backward
+                };
+
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
+
+                println!(
+                    "\tnew_offset: {new_offset:?} horiz: {horiz:?} col: {col:?} mode {mode:?}"
                 );
                 (new_offset, Some(horiz))
             }
-            Movement::DocumentStart => (0, Some(ColPosition::Start)),
+            Movement::DocumentStart => {
+                *affinity = CursorAffinity::Backward;
+                (0, Some(ColPosition::Start))
+            }
             Movement::DocumentEnd => {
                 let last_offset = self
                     .buffer
                     .offset_line_end(self.buffer.len(), mode != Mode::Normal);
+                // so it is past any inlay hint line wraps directly at the end
+                *affinity = CursorAffinity::Forward;
                 (last_offset, Some(ColPosition::End))
             }
             Movement::FirstNonBlank => {
-                let line = self.buffer.line_of_offset(offset);
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let line_info = self
+                    .visual_line_entry(line)
+                    .unwrap_or_else(|| self.last_visual_line_entry());
                 let non_blank_offset =
-                    self.buffer.first_non_blank_character_on_line(line);
-                let start_line_offset = self.buffer.offset_of_line(line);
+                    line_info.first_non_blank_character(&self.buffer.text());
+                let start_line_offset = line_info.interval.start;
+                // TODO: is this always correct? it might not be desirable for the very first character on a wrapped line?
+                *affinity = CursorAffinity::Forward;
                 if offset > non_blank_offset {
                     // Jump to the first non-whitespace character if we're strictly after it
                     (non_blank_offset, Some(ColPosition::FirstNonBlank))
@@ -834,37 +868,61 @@ impl Document {
                 }
             }
             Movement::StartOfLine => {
-                let line = self.buffer.line_of_offset(offset);
-                let new_offset = self.buffer.offset_of_line(line);
+                // TODO: If the line has zero characters, it should probably be forward, but other cases might be better as backwards.
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let new_offset = self.offset_of_visual_line(line);
+                *affinity = CursorAffinity::Forward;
                 (new_offset, Some(ColPosition::Start))
             }
             Movement::EndOfLine => {
-                let new_offset =
-                    self.buffer.offset_line_end(offset, mode != Mode::Normal);
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let line_info = self
+                    .visual_line_entry(line)
+                    .unwrap_or_else(|| self.last_visual_line_entry());
+                let new_col =
+                    line_info.last_col(&self.buffer.text(), mode != Mode::Normal);
+                if new_col == 0 {
+                    *affinity = CursorAffinity::Forward;
+                } else {
+                    *affinity = CursorAffinity::Backward;
+                }
+                let new_offset = self.offset_of_visual_line_col(line_info, new_col);
                 (new_offset, Some(ColPosition::End))
             }
             Movement::Line(position) => {
-                // let line = match position {
-                //     LinePosition::Line(line) => {
-                //         (line - 1).min(self.buffer.last_line())
-                //     }
-                //     LinePosition::First => 0,
-                //     LinePosition::Last => self.buffer.last_line(),
-                // };
-                // let font_size = config.editor.font_size;
-                // let horiz = horiz.cloned().unwrap_or_else(|| {
-                //     ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
-                // });
-                // let col = self.line_horiz_col(
-                //     line,
-                //     font_size,
-                //     &horiz,
-                //     mode != Mode::Normal,
-                // );
+                let line = match position {
+                    LinePosition::Line(line) => {
+                        (line - 1).min(self.buffer.last_line())
+                    }
+                    LinePosition::First => 0,
+                    LinePosition::Last => self.buffer.last_line(),
+                };
+                let line = self.visual_line_of_offset(
+                    self.buffer.offset_of_line(line),
+                    CursorAffinity::Backward,
+                );
+                let line_info = self
+                    .visual_line_entry(line)
+                    .unwrap_or_else(|| self.last_visual_line_entry());
+
+                let font_size = config.editor.font_size;
+                // TODO: is this the right affinity?
+                let horiz = horiz.cloned().unwrap_or_else(|| {
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
+                });
+                let col = self.line_horiz_col(
+                    line_info,
+                    font_size,
+                    &horiz,
+                    mode != Mode::Normal,
+                );
                 // let new_offset = self.buffer.offset_of_line_col(line, col);
-                // (new_offset, Some(horiz))
-                todo!()
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
+                (new_offset, Some(horiz))
             }
+            // TODO: should we force this to give the affinity?
             Movement::Offset(offset) => {
                 let new_offset = *offset;
                 let new_offset = self
@@ -880,6 +938,7 @@ impl Document {
                     count,
                     mode == Mode::Insert,
                 );
+
                 (new_offset, None)
             }
             Movement::WordForward => {
@@ -956,6 +1015,7 @@ impl Document {
                 let prev_text = self.buffer.text().clone();
                 let (new_offset, horiz) = self.move_offset(
                     offset,
+                    &mut cursor.affinity,
                     cursor.horiz.as_ref(),
                     count,
                     movement,
@@ -964,6 +1024,7 @@ impl Document {
                 if let Some(motion_mode) = cursor.motion_mode.clone() {
                     let (moved_new_offset, _) = self.move_offset(
                         new_offset,
+                        &mut cursor.affinity,
                         None,
                         1,
                         &Movement::Right,
@@ -1001,6 +1062,7 @@ impl Document {
             CursorMode::Visual { start, end, mode } => {
                 let (new_offset, horiz) = self.move_offset(
                     end,
+                    &mut cursor.affinity,
                     cursor.horiz.as_ref(),
                     count,
                     movement,
@@ -1016,6 +1078,7 @@ impl Document {
             CursorMode::Insert(ref selection) => {
                 let selection = self.move_selection(
                     selection,
+                    &mut cursor.affinity,
                     count,
                     modify,
                     movement,
@@ -1028,11 +1091,13 @@ impl Document {
 
     /// Returns the point into the text layout of the line at the given offset.
     /// `x` being the leading edge of the character, and `y` being the baseline.
-    pub fn line_point_of_offset(&self, offset: usize, font_size: usize) -> Point {
-        // let (line, col) = self.buffer.offset_to_line_col(offset);
-        let (line, col) = self
-            .lines
-            .visual_line_col_of_offset(&self.buffer.text(), offset);
+    pub fn line_point_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+        font_size: usize,
+    ) -> Point {
+        let (line, col) = self.visual_line_col_of_offset(offset, affinity);
         if let Some(line) = self.visual_line_entry(line) {
             self.line_point_of_line_col(line, col, font_size)
         } else {
@@ -1054,11 +1119,17 @@ impl Document {
     }
 
     /// Get the (point above, point below) of a particular offset within the editor.
-    pub fn points_of_offset(&self, offset: usize) -> (Point, Point) {
+    pub fn points_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> (Point, Point) {
         // let (line, col) = self.buffer.offset_to_line_col(offset);
-        let (line, col) = self
-            .lines
-            .visual_line_col_of_offset(&self.buffer.text(), offset);
+        let (line, col) = self.lines.visual_line_col_of_offset(
+            &self.buffer.text(),
+            offset,
+            affinity,
+        );
         if let Some(line) = self.visual_line_entry(line) {
             self.points_of_line_col(line, col)
         } else {
@@ -1083,7 +1154,7 @@ impl Document {
         // TODO: bound the line? We don't get an *easy* way to get the absolute last line
         // let line = line.min(self.buffer.last_line());
 
-        let phantom_text = self.line_phantom_text2(line);
+        let phantom_text = self.line_phantom_text(line);
         let col = phantom_text.col_after(col, false);
 
         let mut x_shift = 0.0;
@@ -1139,7 +1210,7 @@ impl Document {
         // Put two spaces at the end of the line to make sure there's a place to put the phantom text
         let line_content = format!("{}  ", line_content);
 
-        let phantom_text = self.line_phantom_text2(line);
+        let phantom_text = self.line_phantom_text(line);
         let line_content = phantom_text.combine_with_text(line_content);
 
         let color = config.get_color(LapceColor::EDITOR_FOREGROUND);
@@ -1494,179 +1565,199 @@ impl Document {
         });
     }
 
-    // TODO: replace line_phantom_text with this, and make it actually do it
-    pub fn line_phantom_text2(&self, line: VisualLineEntry) -> PhantomTextLine {
-        return PhantomTextLine::default();
-    }
-
     /// Get the phantom text for a given line
-    pub fn line_phantom_text(&self, line: usize) -> PhantomTextLine {
-        return PhantomTextLine::default();
-
-        // // TODO:
-        // let config = self.config.get_untracked();
+    pub fn line_phantom_text(&self, line: VisualLineEntry) -> PhantomTextLine {
+        println!("line_phantom_text line_info={line:?}");
+        let config = self.config.get_untracked();
 
         // let start_offset = self.buffer.offset_of_line(line);
         // let end_offset = self.buffer.offset_of_line(line + 1);
+        let start_offset = line.interval.start;
+        let end_offset = line.interval.end;
 
-        // // If hints are enabled, and the hints field is filled, then get the hints for this line
-        // // and convert them into PhantomText instances
-        // let hints = config
+        // If hints are enabled, and the hints field is filled, then get the hints for this line
+        // and convert them into PhantomText instances
+        let hints = config
+            .editor
+            .enable_inlay_hints
+            .then_some(())
+            .and(self.inlay_hints.as_ref())
+            .map(|hints| hints.iter_chunks(start_offset..end_offset))
+            .into_iter()
+            .flatten()
+            .filter(|(interval, _)| {
+                interval.start >= start_offset && interval.start < end_offset
+            })
+            .map(|(interval, inlay_hint)| {
+                // TODO(minor): we could probably compute this more efficiently because we already have the relevant line_info
+                let (_, col) = self.visual_line_col_of_offset(
+                    interval.start,
+                    CursorAffinity::Backward,
+                );
+                let text = match &inlay_hint.label {
+                    InlayHintLabel::String(label) => label.to_string(),
+                    InlayHintLabel::LabelParts(parts) => {
+                        parts.iter().map(|p| &p.value).join("")
+                    }
+                };
+                PhantomText {
+                    kind: PhantomTextKind::InlayHint,
+                    col,
+                    text,
+                    fg: Some(*config.get_color(LapceColor::INLAY_HINT_FOREGROUND)),
+                    // font_family: Some(config.editor.inlay_hint_font_family()),
+                    font_size: Some(config.editor.inlay_hint_font_size()),
+                    bg: Some(*config.get_color(LapceColor::INLAY_HINT_BACKGROUND)),
+                    under_line: None,
+                }
+            });
+        // You're quite unlikely to have more than six hints on a single line
+        // this later has the diagnostics added onto it, but that's still likely to be below six
+        // overall.
+        let mut text: SmallVec<[PhantomText; 6]> = hints.collect();
+
+        // The max severity is used to determine the color given to the background of the line
+        let mut max_severity = None;
+        // If error lens is enabled, and the diagnostics field is filled, then get the diagnostics
+        // that end on this line which have a severity worse than HINT and convert them into
+        // PhantomText instances
+        let diag_text = config
+            .editor
+            .enable_error_lens
+            .then_some(())
+            .map(|_| self.diagnostics.diagnostics.get_untracked())
+            .into_iter()
+            .flatten()
+            .filter(|diag| {
+                // diag.diagnostic.range.end.line as usize == line.line
+                //     && line.is_last(self.buffer.text())
+                //     && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
+                if diag.diagnostic.severity >= Some(DiagnosticSeverity::HINT) {
+                    return false;
+                }
+
+                let (start, end) = diag.range;
+                let start_line =
+                    self.visual_line_of_offset(start, CursorAffinity::Backward);
+                let end_line =
+                    self.visual_line_of_offset(end, CursorAffinity::Backward);
+
+                if start_line != end_line {
+                    // If the diagnostic spans multiple lines, then we only want to show it on the
+                    // last line
+                    end_line == line.vline
+                } else {
+                    start_line == line.vline
+                }
+            })
+            .map(|diag| {
+                println!("Diag for line {:?} of {}", line.vline, line.line);
+                let is_last = line.is_last(self.buffer.text());
+                match (diag.diagnostic.severity, max_severity) {
+                    (Some(severity), Some(max)) => {
+                        if severity < max {
+                            max_severity = Some(severity);
+                        }
+                    }
+                    (Some(severity), None) => {
+                        max_severity = Some(severity);
+                    }
+                    _ => {}
+                }
+
+                // let rope_text = self.buffer.rope_text();
+                // let col = rope_text.offset_of_line(line + 1)
+                //     - rope_text.offset_of_line(line);
+                let col = line.last_col(self.buffer.text(), true);
+                let fg = {
+                    let severity = diag
+                        .diagnostic
+                        .severity
+                        .unwrap_or(DiagnosticSeverity::WARNING);
+                    let theme_prop = if severity == DiagnosticSeverity::ERROR {
+                        LapceColor::ERROR_LENS_ERROR_FOREGROUND
+                    } else if severity == DiagnosticSeverity::WARNING {
+                        LapceColor::ERROR_LENS_WARNING_FOREGROUND
+                    } else {
+                        // information + hint (if we keep that) + things without a severity
+                        LapceColor::ERROR_LENS_OTHER_FOREGROUND
+                    };
+
+                    *config.get_color(theme_prop)
+                };
+                let text =
+                    format!("    {}", diag.diagnostic.message.lines().join(" "));
+                PhantomText {
+                    kind: PhantomTextKind::Diagnostic,
+                    col,
+                    text,
+                    fg: Some(fg),
+                    font_size: Some(config.editor.error_lens_font_size()),
+                    // font_family: Some(config.editor.error_lens_font_family()),
+                    bg: None,
+                    under_line: None,
+                }
+            });
+        let mut diag_text: SmallVec<[PhantomText; 6]> = diag_text.collect();
+
+        text.append(&mut diag_text);
+
+        // let (completion_line, completion_col) = self.completion_pos;
+        // let completion_text = config
         //     .editor
-        //     .enable_inlay_hints
+        //     .enable_completion_lens
         //     .then_some(())
-        //     .and(self.inlay_hints.as_ref())
-        //     .map(|hints| hints.iter_chunks(start_offset..end_offset))
-        //     .into_iter()
-        //     .flatten()
-        //     .filter(|(interval, _)| {
-        //         interval.start >= start_offset && interval.start < end_offset
-        //     })
-        //     .map(|(interval, inlay_hint)| {
-        //         let (_, col) = self.buffer.offset_to_line_col(interval.start);
-        //         let text = match &inlay_hint.label {
-        //             InlayHintLabel::String(label) => label.to_string(),
-        //             InlayHintLabel::LabelParts(parts) => {
-        //                 parts.iter().map(|p| &p.value).join("")
-        //             }
-        //         };
-        //         PhantomText {
-        //             kind: PhantomTextKind::InlayHint,
-        //             col,
-        //             text,
-        //             fg: Some(*config.get_color(LapceColor::INLAY_HINT_FOREGROUND)),
-        //             // font_family: Some(config.editor.inlay_hint_font_family()),
-        //             font_size: Some(config.editor.inlay_hint_font_size()),
-        //             bg: Some(*config.get_color(LapceColor::INLAY_HINT_BACKGROUND)),
-        //             under_line: None,
-        //         }
+        //     .and(self.completion.as_ref())
+        //     // TODO: We're probably missing on various useful completion things to include here!
+        //     .filter(|_| line == completion_line)
+        //     .map(|completion| PhantomText {
+        //         kind: PhantomTextKind::Completion,
+        //         col: completion_col,
+        //         text: completion.to_string(),
+        //         fg: Some(
+        //             config
+        //                 .get_color_unchecked(LapceTheme::COMPLETION_LENS_FOREGROUND)
+        //                 .clone(),
+        //         ),
+        //         font_size: Some(config.editor.completion_lens_font_size()),
+        //         font_family: Some(config.editor.completion_lens_font_family()),
+        //         bg: None,
+        //         under_line: None,
+        //         // TODO: italics?
         //     });
-        // // You're quite unlikely to have more than six hints on a single line
-        // // this later has the diagnostics added onto it, but that's still likely to be below six
-        // // overall.
-        // let mut text: SmallVec<[PhantomText; 6]> = hints.collect();
+        // if let Some(completion_text) = completion_text {
+        //     text.push(completion_text);
+        // }
 
-        // // The max severity is used to determine the color given to the background of the line
-        // let mut max_severity = None;
-        // // If error lens is enabled, and the diagnostics field is filled, then get the diagnostics
-        // // that end on this line which have a severity worse than HINT and convert them into
-        // // PhantomText instances
-        // let diag_text = config
-        //     .editor
-        //     .enable_error_lens
-        //     .then_some(())
-        //     .map(|_| self.diagnostics.diagnostics.get_untracked())
-        //     .into_iter()
-        //     .flatten()
-        //     .filter(|diag| {
-        //         diag.diagnostic.range.end.line as usize == line
-        //             && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
-        //     })
-        //     .map(|diag| {
-        //         match (diag.diagnostic.severity, max_severity) {
-        //             (Some(severity), Some(max)) => {
-        //                 if severity < max {
-        //                     max_severity = Some(severity);
-        //                 }
-        //             }
-        //             (Some(severity), None) => {
-        //                 max_severity = Some(severity);
-        //             }
-        //             _ => {}
-        //         }
-
-        //         let rope_text = self.buffer.rope_text();
-        //         let col = rope_text.offset_of_line(line + 1)
-        //             - rope_text.offset_of_line(line);
-        //         let fg = {
-        //             let severity = diag
-        //                 .diagnostic
-        //                 .severity
-        //                 .unwrap_or(DiagnosticSeverity::WARNING);
-        //             let theme_prop = if severity == DiagnosticSeverity::ERROR {
-        //                 LapceColor::ERROR_LENS_ERROR_FOREGROUND
-        //             } else if severity == DiagnosticSeverity::WARNING {
-        //                 LapceColor::ERROR_LENS_WARNING_FOREGROUND
-        //             } else {
-        //                 // information + hint (if we keep that) + things without a severity
-        //                 LapceColor::ERROR_LENS_OTHER_FOREGROUND
-        //             };
-
-        //             *config.get_color(theme_prop)
-        //         };
-        //         let text =
-        //             format!("    {}", diag.diagnostic.message.lines().join(" "));
-        //         PhantomText {
-        //             kind: PhantomTextKind::Diagnostic,
+        // if let Some(ime_text) = self.ime_text.as_ref() {
+        //     let (ime_line, col, _) = self.ime_pos;
+        //     if line == ime_line {
+        //         text.push(PhantomText {
+        //             kind: PhantomTextKind::Ime,
+        //             text: ime_text.to_string(),
         //             col,
-        //             text,
-        //             fg: Some(fg),
-        //             font_size: Some(config.editor.error_lens_font_size()),
-        //             // font_family: Some(config.editor.error_lens_font_family()),
+        //             font_size: None,
+        //             font_family: None,
+        //             fg: None,
         //             bg: None,
-        //             under_line: None,
-        //         }
-        //     });
-        // let mut diag_text: SmallVec<[PhantomText; 6]> = diag_text.collect();
-
-        // text.append(&mut diag_text);
-
-        // // let (completion_line, completion_col) = self.completion_pos;
-        // // let completion_text = config
-        // //     .editor
-        // //     .enable_completion_lens
-        // //     .then_some(())
-        // //     .and(self.completion.as_ref())
-        // //     // TODO: We're probably missing on various useful completion things to include here!
-        // //     .filter(|_| line == completion_line)
-        // //     .map(|completion| PhantomText {
-        // //         kind: PhantomTextKind::Completion,
-        // //         col: completion_col,
-        // //         text: completion.to_string(),
-        // //         fg: Some(
-        // //             config
-        // //                 .get_color_unchecked(LapceTheme::COMPLETION_LENS_FOREGROUND)
-        // //                 .clone(),
-        // //         ),
-        // //         font_size: Some(config.editor.completion_lens_font_size()),
-        // //         font_family: Some(config.editor.completion_lens_font_family()),
-        // //         bg: None,
-        // //         under_line: None,
-        // //         // TODO: italics?
-        // //     });
-        // // if let Some(completion_text) = completion_text {
-        // //     text.push(completion_text);
-        // // }
-
-        // // if let Some(ime_text) = self.ime_text.as_ref() {
-        // //     let (ime_line, col, _) = self.ime_pos;
-        // //     if line == ime_line {
-        // //         text.push(PhantomText {
-        // //             kind: PhantomTextKind::Ime,
-        // //             text: ime_text.to_string(),
-        // //             col,
-        // //             font_size: None,
-        // //             font_family: None,
-        // //             fg: None,
-        // //             bg: None,
-        // //             under_line: Some(
-        // //                 config
-        // //                     .get_color_unchecked(LapceTheme::EDITOR_FOREGROUND)
-        // //                     .clone(),
-        // //             ),
-        // //         });
-        // //     }
-        // // }
-
-        // text.sort_by(|a, b| {
-        //     if a.col == b.col {
-        //         a.kind.cmp(&b.kind)
-        //     } else {
-        //         a.col.cmp(&b.col)
+        //             under_line: Some(
+        //                 config
+        //                     .get_color_unchecked(LapceTheme::EDITOR_FOREGROUND)
+        //                     .clone(),
+        //             ),
+        //         });
         //     }
-        // });
+        // }
 
-        // PhantomTextLine { text, max_severity }
+        text.sort_by(|a, b| {
+            if a.col == b.col {
+                a.kind.cmp(&b.kind)
+            } else {
+                a.col.cmp(&b.col)
+            }
+        });
+
+        PhantomTextLine { text, max_severity }
     }
 
     /// Update the diagnostics' positions after an edit so that they appear in the correct place.

@@ -4,6 +4,7 @@ use std::{borrow::Cow, cmp::Ordering, ops::Range};
 
 use lapce_core::{
     buffer::{rope_text::RopeText, InvalLines},
+    cursor::CursorAffinity,
     word::WordCursor,
 };
 use lapce_xi_rope::{
@@ -82,6 +83,18 @@ impl VisualLineEntry {
         }
     }
 
+    /// Is this the last visual line for the relevant buffer line?
+    pub fn is_last(&self, text: &Rope) -> bool {
+        let rtext = RopeText::new(text);
+        let line_end = rtext.line_end_offset(self.line, false);
+        let vline_end = self.line_end_offset(text, false);
+        println!(
+            "\tline={}; vline={:?}; line_end={} ==? vline_end={}",
+            self.line, self.vline, line_end, vline_end
+        );
+        line_end == vline_end
+    }
+
     pub fn last_col(&self, text: &Rope, caret: bool) -> usize {
         let line_start = self.interval.start;
         let end_offset = self.line_end_offset(text, caret);
@@ -105,6 +118,7 @@ impl VisualLineEntry {
         offset
     }
 
+    /// Returns the offset of the first non-blank character in the line.
     pub fn first_non_blank_character(&self, text: &Rope) -> usize {
         WordCursor::new(&text, self.interval.start).next_non_blank_char()
     }
@@ -204,10 +218,32 @@ impl Lines {
         self.work.iter().any(|t| !t.intersect(iv).is_empty())
     }
 
-    pub fn visual_line_of_offset(&self, text: &Rope, offset: usize) -> VisualLine {
+    // TODO: add tests for affinity behavior
+    // TODO: if we, in practice, always set caret_breaks to false we should just remove it and use that as the default
+    // TODO: does xi-editor have the issue of it being on the wrong line? How do they manage the cursor?
+    /// `affinity` decides whether an offset at a soft line break is considered to be on the
+    /// previous line or the next line.  
+    /// If `affinity` is `CursorAffinity::Forward` and is at the very end of the wrapped line, then
+    /// the offset is considered to be on the next line.
+    ///
+    /// # Panics
+    /// Panics of `offset > text.len()`
+    pub fn visual_line_of_offset(
+        &self,
+        text: &Rope,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> VisualLine {
+        println!("=== Offset: {offset}; text len: {}", text.len());
         let mut line = text.line_of_offset(offset);
         if self.wrap != WrapStyle::None {
             line += self.breaks.count::<BreaksMetric>(offset);
+            if let CursorAffinity::Backward = affinity {
+                let line_end = self.offset_of_visual_line(text, VisualLine(line));
+                if line_end == offset && line != 0 {
+                    line -= 1;
+                }
+            }
         }
         VisualLine(line)
     }
@@ -216,11 +252,16 @@ impl Lines {
         &self,
         text: &Rope,
         offset: usize,
+        affinity: CursorAffinity,
     ) -> (VisualLine, usize) {
         // TODO: this is probably doing extra unneeded work
-        let line = self.visual_line_of_offset(text, offset);
+        let line = self.visual_line_of_offset(text, offset, affinity);
+        let line_info = self.iter_lines(text, line).next().unwrap();
         let line_offset = self.offset_of_visual_line(text, line);
+
         let col = offset - line_offset;
+        let col = col.min(line_info.last_col(text, true));
+
         (line, col)
     }
 
@@ -241,12 +282,31 @@ impl Lines {
     pub fn offset_of_visual_line_col(
         &self,
         text: &Rope,
-        line: VisualLine,
+        line_info: VisualLineEntry,
         col: usize,
     ) -> usize {
-        // TODO: buffer offset_of_line_col does more intricate logic!
-        let line_offset = self.offset_of_visual_line(text, line);
-        line_offset + col
+        // TODO: this is the same logic as ropetexts offset of line col. We could generalize that to an interval so we don't rewrite it here.
+        // // TODO: buffer offset_of_line_col does more intricate logic!
+        // let line_offset = self.offset_of_visual_line(text, line);
+        // line_offset + col
+
+        let mut pos = 0;
+        // let mut offset = self.offset_of_visual_line(text, line);
+
+        let mut offset = line_info.interval.start;
+        for c in text.slice_to_cow(line_info.interval).chars() {
+            if c == '\n' {
+                return offset;
+            }
+
+            let char_len = c.len_utf8();
+            if pos + char_len > col {
+                return offset;
+            }
+            pos += char_len;
+            offset += char_len;
+        }
+        offset
     }
 
     pub fn last_visual_line(&self, text: &Rope) -> VisualLineEntry {
@@ -270,6 +330,7 @@ impl Lines {
         let mut cursor = MergedBreaks::new(text, &self.breaks);
         let offset = cursor.offset_of_line(start_line);
         let buffer_line = text.line_of_offset(offset);
+        println!("Start line: {start_line:?}; offset: {offset}; buffer_line: {buffer_line}");
         cursor.set_offset(offset);
         VisualLines {
             offset,
@@ -278,6 +339,7 @@ impl Lines {
             buffer_line,
             eof: false,
             cur_line: start_line,
+            is_first_iter: true,
         }
     }
 
@@ -745,6 +807,7 @@ struct VisualLines<'a> {
     len: usize,
     eof: bool,
     cur_line: VisualLine,
+    is_first_iter: bool,
 }
 
 impl<'a> Iterator for VisualLines<'a> {
@@ -752,8 +815,9 @@ impl<'a> Iterator for VisualLines<'a> {
 
     fn next(&mut self) -> Option<VisualLineEntry> {
         let is_first = self.cursor.is_hard_break();
-        if is_first {
+        if is_first || self.is_first_iter {
             self.buffer_line += 1;
+            self.is_first_iter = false;
         }
         let line_num = self.buffer_line.saturating_sub(1);
 
@@ -936,6 +1000,7 @@ fn merged_line_of_offset(text: &Rope, soft: &Breaks, offset: usize) -> usize {
 mod tests {
     use std::{borrow::Cow, ops::Range};
 
+    use lapce_core::cursor::CursorAffinity;
     use lapce_xi_rope::{
         breaks::{BreakBuilder, Breaks, BreaksMetric},
         Cursor, Interval, LinesMetric, Rope,
@@ -1249,7 +1314,8 @@ mod tests {
         let lines = make_lines(&text, 1.);
 
         for offset in 0..text.len() {
-            let line = lines.visual_line_of_offset(&text, offset);
+            let line =
+                lines.visual_line_of_offset(&text, offset, CursorAffinity::Forward);
             let line_offset = lines.offset_of_visual_line(&text, line);
             assert!(
                 line_offset <= offset,
@@ -1301,14 +1367,54 @@ mod tests {
         let cursor = MergedBreaks::new(&text, &lines.breaks);
         assert_eq!(cursor.total_lines, 4);
 
-        assert_eq!(lines.visual_line_of_offset(&text, 0).get(), 0);
-        assert_eq!(lines.visual_line_of_offset(&text, 1).get(), 0);
-        assert_eq!(lines.visual_line_of_offset(&text, 2).get(), 1);
-        assert_eq!(lines.visual_line_of_offset(&text, 3).get(), 1);
-        assert_eq!(lines.visual_line_of_offset(&text, 4).get(), 2);
-        assert_eq!(lines.visual_line_of_offset(&text, 5).get(), 2);
-        assert_eq!(lines.visual_line_of_offset(&text, 6).get(), 3);
-        assert_eq!(lines.visual_line_of_offset(&text, 7).get(), 3);
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 0, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 1, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 2, CursorAffinity::Forward)
+                .get(),
+            1
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 3, CursorAffinity::Forward)
+                .get(),
+            1
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 4, CursorAffinity::Forward)
+                .get(),
+            2
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 5, CursorAffinity::Forward)
+                .get(),
+            2
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 6, CursorAffinity::Forward)
+                .get(),
+            3
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 7, CursorAffinity::Forward)
+                .get(),
+            3
+        );
 
         assert_eq!(lines.offset_of_visual_line(&text, VisualLine(0)), 0);
         assert_eq!(lines.offset_of_visual_line(&text, VisualLine(1)), 2);
@@ -1317,7 +1423,8 @@ mod tests {
         assert_eq!(lines.offset_of_visual_line(&text, VisualLine(10)), 8);
 
         for offset in 0..text.len() {
-            let line = lines.visual_line_of_offset(&text, offset);
+            let line =
+                lines.visual_line_of_offset(&text, offset, CursorAffinity::Forward);
             let line_offset = lines.offset_of_visual_line(&text, line);
             assert!(
                 line_offset <= offset,
@@ -1360,32 +1467,35 @@ mod tests {
     fn line_numbers() {
         let text: Rope = "aaaa\nbb bb cc\ncc dddd eeee ff\nff gggg".into();
         let lines = make_lines(&text, 2.);
-        let nums: Vec<_> = lines
-            .iter_lines(&text, VisualLine(0))
-            .map(|l| {
-                (
-                    l.line,
-                    l.vline.get(),
-                    l.is_first,
-                    text.slice_to_cow(l.interval),
-                )
-            })
-            .collect();
-        assert_eq!(
-            nums,
-            vec![
-                (0, 0, true, "aaaa\n".into()),
-                (1, 1, true, "bb ".into()),
-                (1, 2, false, "bb ".into()),
-                (1, 3, false, "cc\n".into()),
-                (2, 4, true, "cc ".into()),
-                (2, 5, false, "dddd ".into()),
-                (2, 6, false, "eeee ".into()),
-                (2, 7, false, "ff\n".into()),
-                (3, 8, true, "ff ".into()),
-                (3, 9, false, "gggg".into()),
-            ]
-        );
+        let get_nums = |start_vline: usize| {
+            lines
+                .iter_lines(&text, VisualLine(start_vline))
+                .map(|l| {
+                    (
+                        l.line,
+                        l.vline.get(),
+                        l.is_first,
+                        text.slice_to_cow(l.interval),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let x = vec![
+            (0, 0, true, "aaaa\n".into()),
+            (1, 1, true, "bb ".into()),
+            (1, 2, false, "bb ".into()),
+            (1, 3, false, "cc\n".into()),
+            (2, 4, true, "cc ".into()),
+            (2, 5, false, "dddd ".into()),
+            (2, 6, false, "eeee ".into()),
+            (2, 7, false, "ff\n".into()),
+            (3, 8, true, "ff ".into()),
+            (3, 9, false, "gggg".into()),
+        ];
+
+        for i in 0..x.len() {
+            assert_eq!(get_nums(i), &x[i..], "failed at #{i}");
+        }
     }
 
     fn make_ranges(ivs: &[Interval]) -> Vec<Range<usize>> {
