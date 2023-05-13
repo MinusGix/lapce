@@ -314,7 +314,7 @@ impl Document {
         let wrap_style = config.editor.wrap_style();
         self.lines.set_wrap_style(self.buffer.text(), wrap_style);
 
-        // This might be a fine place to do this, but it may be better to do it wherever this is getting drawn. We should also only pay attention to actually visible lines, but that depends on the scroll position!
+        // This logic should really be done in the editor view. However currently lines is linked to the document.
         let mut width_calc = {
             let config = self.config.get_untracked();
             let family: SmallVec<[FamilyOwned; 3]> =
@@ -325,7 +325,8 @@ impl Document {
         self.lines.rewrap_chunk(
             &self.buffer.text(),
             &mut width_calc,
-            VisualLine(0)..VisualLine(1000),
+            // TODO: get visible line information passed in from editor view!
+            VisualLine(0)..VisualLine(self.buffer.last_line() + 1),
         );
     }
 
@@ -431,12 +432,21 @@ impl Document {
             self.update_styles(delta);
             self.update_inlay_hints(delta);
             self.update_diagnostics(delta);
+
+            // TODO: is this logic even correct?? I think the issue is that reload can be called before breaks is ready? If we assume breaks is fine, then the `MergedBreaks` code will have issues.
+            let range = if self.lines.is_breaks_correct_len(&self.buffer.text()) {
+                VisualLine(0)
+                    ..VisualLine(self.last_visual_line_info().vline.get() + 1)
+            } else {
+                VisualLine(0)..VisualLine(self.buffer.last_line() + 1)
+            };
             self.lines.after_edit(
                 &cur_text,
                 &cur_prev_text,
                 delta,
                 &mut width_calc,
-                VisualLine(0)..VisualLine(1000),
+                // TODO: get visible line information passed in from editor view!
+                range,
             );
             // self.update_completion(delta);
             if let DocContent::File(path) = &self.content {

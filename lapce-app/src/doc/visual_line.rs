@@ -175,6 +175,10 @@ impl Lines {
         self.wrap = wrap;
     }
 
+    pub fn is_breaks_correct_len(&self, text: &Rope) -> bool {
+        self.breaks.len() == text.len()
+    }
+
     /// Add an interval to be (re)wrapped, merging it with existing work.
     fn add_task<T: Into<Interval>>(&mut self, iv: T) {
         let iv = iv.into();
@@ -559,7 +563,6 @@ impl Lines {
         visible_lines: Range<VisualLine>,
         max_lines: Option<usize>,
     ) -> WrapSummary {
-        use self::WrapStyle::*;
         // 'line' is a poor unit here; could do some fancy Duration thing?
         const MAX_LINES_PER_BATCH: usize = 500;
 
@@ -577,9 +580,11 @@ impl Lines {
 
         let mut bcalc = ByteWidthCalc;
         let mut ctx = match self.wrap {
-            Bytes(b) => RewrapCtx::new(text, b as f64, &mut bcalc, task.start),
-            Width(w) => RewrapCtx::new(text, w, width_cache, task.start),
-            None => unreachable!(),
+            WrapStyle::Bytes(b) => {
+                RewrapCtx::new(text, b as f64, &mut bcalc, task.start)
+            }
+            WrapStyle::Width(w) => RewrapCtx::new(text, w, width_cache, task.start),
+            WrapStyle::None => unreachable!(),
         };
 
         let start_line = cursor.cur_line;
