@@ -15,7 +15,7 @@ use lapce_core::{
     buffer::{Buffer, InvalLines},
     char_buffer::CharBuffer,
     command::EditCommand,
-    cursor::{ColPosition, Cursor, CursorMode},
+    cursor::{ColPosition, Cursor, CursorAffinity, CursorMode},
     editor::{EditType, Editor},
     mode::Mode,
     movement::{LinePosition, Movement},
@@ -47,9 +47,15 @@ use crate::{
     workspace::LapceWorkspace,
 };
 
-use self::phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine};
+use self::{
+    phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
+    visual_line::{Lines, VisualLine, VisualLineInfo, WrapStyle},
+    width_calc::BasicWidthCalc,
+};
 
 mod phantom_text;
+pub mod visual_line;
+mod width_calc;
 
 pub struct SystemClipboard {}
 
@@ -69,6 +75,15 @@ impl Clipboard for SystemClipboard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocWrap {
+    /// No wrapping whatsoever.  
+    /// Typically used for input boxes.
+    None,
+    /// Use the `config.editor` wrap settings
+    Editor,
+}
+
 #[derive(Clone, Debug)]
 pub struct DiagnosticData {
     pub expanded: RwSignal<bool>,
@@ -77,6 +92,7 @@ pub struct DiagnosticData {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorDiagnostic {
+    /// (start offset, end offset)
     pub range: (usize, usize),
     pub diagnostic: Diagnostic,
 }
@@ -109,7 +125,7 @@ pub struct TextLayoutCache {
     /// (Font Size -> (Line Number -> Text Layout))  
     /// Different font-sizes are cached separately, which is useful for features like code lens
     /// where the text becomes small but you may wish to revert quickly.
-    pub layouts: HashMap<usize, HashMap<usize, Arc<TextLayoutLine>>>,
+    pub layouts: HashMap<usize, HashMap<VisualLine, Arc<TextLayoutLine>>>,
     pub max_width: f64,
 }
 
@@ -182,6 +198,9 @@ pub struct Document {
     /// Whether the buffer's content has been loaded/initialized into the buffer.
     loaded: bool,
 
+    lines: Lines,
+    pub wrap: DocWrap,
+
     /// The ready-to-render text layouts for the document.  
     /// This is an `Rc<RefCell<_>>` due to needing to access it even when the document is borrowed,
     /// since we may need to fill it with constructed text layouts.
@@ -193,27 +212,32 @@ pub struct Document {
 pub struct DocLine {
     pub rev: u64,
     pub style_rev: u64,
-    pub line: usize,
+    pub line_info: VisualLineInfo,
     pub text: Arc<TextLayoutLine>,
-    pub code_actions: Option<Arc<(PluginId, CodeActionResponse)>>,
 }
 
 impl VirtualListVector<DocLine> for Document {
     type ItemIterator = std::vec::IntoIter<DocLine>;
 
     fn total_len(&self) -> usize {
-        self.buffer.num_lines()
+        // TODO(minor): does this need to be cached?
+        self.lines.last_visual_line(&self.buffer.text()).vline.get() + 1
     }
 
     fn slice(&mut self, range: std::ops::Range<usize>) -> Self::ItemIterator {
-        let lines = range
-            .into_iter()
-            .map(|line| DocLine {
+        // TODO: is this where we should do necessary rewrap?
+        let lines = self
+            .lines
+            .iter_lines_over(
+                &self.buffer.text(),
+                VisualLine(range.start),
+                VisualLine(range.end),
+            )
+            .map(|line_info| DocLine {
                 rev: self.buffer.rev(),
                 style_rev: self.style_rev,
-                line,
-                text: self.get_text_layout(line, 12),
-                code_actions: self.code_actions.get(&line).cloned(),
+                line_info,
+                text: self.get_text_layout(line_info, 12),
             })
             .collect::<Vec<_>>();
         lines.into_iter()
@@ -227,6 +251,7 @@ impl Document {
         diagnostics: DiagnosticData,
         proxy: ProxyRpcHandler,
         config: ReadSignal<Arc<LapceConfig>>,
+        wrap: DocWrap,
     ) -> Self {
         let syntax = Syntax::init(&path);
         Self {
@@ -240,6 +265,8 @@ impl Document {
             diagnostics,
             content: DocContent::File(path),
             loaded: false,
+            lines: Lines::default(),
+            wrap,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -251,6 +278,7 @@ impl Document {
         cx: Scope,
         proxy: ProxyRpcHandler,
         config: ReadSignal<Arc<LapceConfig>>,
+        wrap: DocWrap,
     ) -> Self {
         Self {
             buffer_id: BufferId::next(),
@@ -266,6 +294,8 @@ impl Document {
                 diagnostics: create_rw_signal(cx, im::Vector::new()),
             },
             loaded: true,
+            lines: Lines::default(),
+            wrap,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -293,6 +323,23 @@ impl Document {
         self.loaded = true;
         self.on_update(None);
         self.init_diagnostics();
+
+        self.init_wrap();
+
+        // This logic should really be done in the editor view. However currently lines is linked to the document.
+        let mut width_calc = {
+            let config = self.config.get_untracked();
+            let family: SmallVec<[FamilyOwned; 3]> =
+                FamilyOwned::parse_list(&config.editor.font_family).collect();
+            let font_size = config.editor.font_size as f32;
+            BasicWidthCalc::new(family, font_size)
+        };
+        self.lines.rewrap_chunk(
+            &self.buffer.text(),
+            &mut width_calc,
+            // TODO: get visible line information passed in from editor view!
+            VisualLine(0)..VisualLine(self.buffer.last_line() + 1),
+        );
     }
 
     /// Reload the document's content, and is what you should typically use when you want to *set*
@@ -300,8 +347,24 @@ impl Document {
     pub fn reload(&mut self, content: Rope, set_pristine: bool) {
         // self.code_actions.clear();
         // self.inlay_hints = None;
+        self.init_wrap();
+        let prev_text = self.buffer.text().clone();
         let delta = self.buffer.reload(content, set_pristine);
-        self.apply_deltas(&[delta]);
+        self.apply_deltas(&prev_text, &[delta]);
+    }
+
+    /// Initialize the line wrapping logic with the appropriate wrap style.  
+    /// This does not perform any wrapping by itself.
+    fn init_wrap(&mut self) {
+        let wrap_style = match self.wrap {
+            DocWrap::None => WrapStyle::None,
+            DocWrap::Editor => {
+                let config = self.config.get_untracked();
+                config.editor.wrap_style()
+            }
+        };
+
+        self.lines.set_wrap_style(self.buffer.text(), wrap_style);
     }
 
     pub fn do_insert(
@@ -310,6 +373,7 @@ impl Document {
         s: &str,
         config: &LapceConfig,
     ) -> Vec<(RopeDelta, InvalLines, SyntaxEdit)> {
+        let prev_text = self.buffer.text().clone();
         let old_cursor = cursor.mode.clone();
         let deltas = Editor::insert(
             cursor,
@@ -321,7 +385,7 @@ impl Document {
         // Keep track of the change in the cursor mode for undo/redo
         self.buffer.set_cursor_before(old_cursor);
         self.buffer.set_cursor_after(cursor.mode.clone());
-        self.apply_deltas(&deltas);
+        self.apply_deltas(&prev_text, &deltas);
         deltas
     }
 
@@ -330,8 +394,12 @@ impl Document {
         edits: &[(impl AsRef<Selection>, &str)],
         edit_type: EditType,
     ) -> (RopeDelta, InvalLines, SyntaxEdit) {
+        let prev_text = self.buffer.text().clone();
         let (delta, inval_lines, edits) = self.buffer.edit(edits, edit_type);
-        self.apply_deltas(&[(delta.clone(), inval_lines.clone(), edits.clone())]);
+        self.apply_deltas(
+            &prev_text,
+            &[(delta.clone(), inval_lines.clone(), edits.clone())],
+        );
         (delta, inval_lines, edits)
     }
 
@@ -344,6 +412,7 @@ impl Document {
     ) -> Vec<(RopeDelta, InvalLines, SyntaxEdit)> {
         let mut clipboard = SystemClipboard {};
         let old_cursor = cursor.mode.clone();
+        let prev_text = self.buffer.text().clone();
         let deltas = Editor::do_edit(
             cursor,
             &mut self.buffer,
@@ -359,22 +428,63 @@ impl Document {
             self.buffer.set_cursor_after(cursor.mode.clone());
         }
 
-        self.apply_deltas(&deltas);
+        self.apply_deltas(&prev_text, &deltas);
         deltas
     }
 
-    fn apply_deltas(&mut self, deltas: &[(RopeDelta, InvalLines, SyntaxEdit)]) {
+    fn apply_deltas(
+        &mut self,
+        prev_text: &Rope,
+        deltas: &[(RopeDelta, InvalLines, SyntaxEdit)],
+    ) {
         let rev = self.rev() - deltas.len() as u64;
+        let mut width_calc = {
+            let config = self.config.get_untracked();
+            let family: SmallVec<[FamilyOwned; 3]> =
+                FamilyOwned::parse_list(&config.editor.font_family).collect();
+            let font_size = config.editor.font_size as f32;
+            BasicWidthCalc::new(family, font_size)
+        };
+
+        let mut cur_prev_text = prev_text.clone();
         for (i, (delta, _, _)) in deltas.iter().enumerate() {
+            // If there's any remaining deltas, then we apply this delta to prev_text
+            let cur_text = if i < deltas.len() - 1 {
+                delta.apply(prev_text)
+            } else {
+                // the current buffer alreadyt has the last/only delta applied
+                self.buffer.text().clone()
+            };
+
             self.update_styles(delta);
             self.update_inlay_hints(delta);
             self.update_diagnostics(delta);
+
+            // TODO: is this logic even correct?? I think the issue is that reload can be called before breaks is ready? If we assume breaks is fine, then the `MergedBreaks` code will have issues.
+            let range = if self.lines.is_breaks_correct_len(&self.buffer.text()) {
+                VisualLine(0)
+                    ..VisualLine(self.last_visual_line_info().vline.get() + 1)
+            } else {
+                VisualLine(0)..VisualLine(self.buffer.last_line() + 1)
+            };
+            self.lines.after_edit(
+                &cur_text,
+                &cur_prev_text,
+                delta,
+                &mut width_calc,
+                // TODO: get visible line information passed in from editor view!
+                range,
+            );
             // self.update_completion(delta);
             if let DocContent::File(path) = &self.content {
                 self.proxy
                     .update(path.clone(), delta.clone(), rev + i as u64 + 1);
             }
+
+            cur_prev_text = cur_text;
         }
+        // TODO: do we actually need to do this? probably not
+        self.clear_text_layout_cache();
 
         // TODO(minor): We could avoid this potential allocation since most apply_delta callers are actually using a Vec
         // which we could reuse.
@@ -447,25 +557,83 @@ impl Document {
         self.code_actions.clear();
     }
 
+    pub fn visual_line_info(&self, line: VisualLine) -> VisualLineInfo {
+        self.lines
+            .iter_lines(&self.buffer.text(), line)
+            .next()
+            .unwrap_or_else(|| self.last_visual_line_info())
+    }
+
+    /// The [`VisualLineInfo`] of the last line in the display.  
+    /// Note that if the wrapping has not yet been completed for the last line, this
+    /// will unwrapped results.
+    pub fn last_visual_line_info(&self) -> VisualLineInfo {
+        self.lines.last_visual_line(&self.buffer.text())
+    }
+
+    // TODO: we could just have a trait for 'treat this as a rope' and implement it for ropes and document, so then this can purely be a method on VisualLineEntry, passing in the doc/rope. This would also avoid other repetitive functions.
+    pub fn last_col(&self, line: VisualLineInfo, caret: bool) -> usize {
+        line.last_col(&self.buffer.text(), caret)
+    }
+
+    pub fn iter_visual_lines<'a>(
+        &'a self,
+        start_line: VisualLine,
+    ) -> impl Iterator<Item = VisualLineInfo> + 'a {
+        self.lines.iter_lines(&self.buffer.text(), start_line)
+    }
+
+    pub fn offset_of_visual_line(&self, line_info: VisualLine) -> usize {
+        self.lines
+            .offset_of_visual_line(&self.buffer.text(), line_info)
+    }
+
+    pub fn offset_of_visual_line_col(
+        &self,
+        line_info: VisualLineInfo,
+        col: usize,
+    ) -> usize {
+        self.lines
+            .offset_of_visual_line_col(&self.buffer.text(), line_info, col)
+    }
+
+    pub fn visual_line_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> VisualLine {
+        self.lines
+            .visual_line_of_offset(&self.buffer.text(), offset, affinity)
+    }
+
+    pub fn visual_line_col_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> (VisualLine, usize) {
+        self.lines
+            .visual_line_col_of_offset(&self.buffer.text(), offset, affinity)
+    }
+
     pub fn line_horiz_col(
         &self,
-        line: usize,
+        line_info: VisualLineInfo,
         font_size: usize,
         horiz: &ColPosition,
         caret: bool,
     ) -> usize {
         match *horiz {
             ColPosition::Col(x) => {
-                let text_layout = self.get_text_layout(line, font_size);
+                let text_layout = self.get_text_layout(line_info, font_size);
                 let hit_point = text_layout.text.hit_point(Point::new(x, 0.0));
                 let n = hit_point.index;
 
-                n.min(self.buffer.line_end_col(line, caret))
+                n.min(self.last_col(line_info, caret))
             }
-            ColPosition::End => self.buffer.line_end_col(line, caret),
+            ColPosition::End => self.last_col(line_info, caret),
             ColPosition::Start => 0,
             ColPosition::FirstNonBlank => {
-                self.buffer.first_non_blank_character_on_line(line)
+                line_info.first_non_blank_character(&self.buffer.text())
             }
         }
     }
@@ -476,6 +644,7 @@ impl Document {
     fn move_region(
         &self,
         region: &SelRegion,
+        affinity: &mut CursorAffinity,
         count: usize,
         modify: bool,
         movement: &Movement,
@@ -507,6 +676,7 @@ impl Document {
 
         let (end, horiz) = self.move_offset(
             region.end,
+            affinity,
             region.horiz.as_ref(),
             count,
             movement,
@@ -522,15 +692,18 @@ impl Document {
     pub fn move_selection(
         &self,
         selection: &Selection,
+        affinity: &mut CursorAffinity,
         count: usize,
         modify: bool,
         movement: &Movement,
         mode: Mode,
     ) -> Selection {
+        // TODO: this usage of affinity might not work completely right. Should it be per selection or something?
         let mut new_selection = Selection::new();
         for region in selection.regions() {
-            new_selection
-                .add_region(self.move_region(region, count, modify, movement, mode));
+            new_selection.add_region(
+                self.move_region(region, affinity, count, modify, movement, mode),
+            );
         }
         new_selection
     }
@@ -538,6 +711,7 @@ impl Document {
     pub fn move_offset(
         &self,
         offset: usize,
+        affinity: &mut CursorAffinity,
         horiz: Option<&ColPosition>,
         count: usize,
         movement: &Movement,
@@ -557,6 +731,8 @@ impl Document {
                     );
                 }
 
+                *affinity = CursorAffinity::Forward;
+
                 (new_offset, None)
             }
             Movement::Right => {
@@ -571,81 +747,129 @@ impl Document {
                     );
                 }
 
+                let (line, col) = self.visual_line_col_of_offset(offset, *affinity);
+                let line_info = self.visual_line_info(line);
+
+                if col == line_info.last_col(self.buffer.text(), true) {
+                    *affinity = CursorAffinity::Forward;
+                } else {
+                    *affinity = CursorAffinity::Backward;
+                }
+
                 (new_offset, None)
             }
             Movement::Up => {
                 let font_size = config.editor.font_size;
 
-                let line = self.buffer.line_of_offset(offset);
-                if line == 0 {
-                    let line = self.buffer.line_of_offset(offset);
-                    let new_offset = self.buffer.offset_of_line(line);
+                let line = self.lines.visual_line_of_offset(
+                    &self.buffer.text(),
+                    offset,
+                    *affinity,
+                );
+                if line.get() == 0 {
+                    let new_offset =
+                        self.lines.offset_of_visual_line(&self.buffer.text(), line);
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
-                            self.line_point_of_offset(offset, font_size).x,
+                            self.line_point_of_offset(offset, *affinity, font_size)
+                                .x,
                         )
                     });
+
                     return (new_offset, Some(horiz));
                 }
 
-                let line = line.saturating_sub(count);
+                let line = VisualLine(line.get().saturating_sub(count));
+                let line_info = self.visual_line_info(line);
 
+                // TODO: is this the correct affinity?
                 let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
                 });
                 let col = self.line_horiz_col(
-                    line,
+                    line_info,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
+                *affinity = if col == 0 {
+                    CursorAffinity::Forward
+                } else {
+                    CursorAffinity::Backward
+                };
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
                 (new_offset, Some(horiz))
             }
             Movement::Down => {
                 let font_size = config.editor.font_size;
 
-                let last_line = self.buffer.last_line();
-                let line = self.buffer.line_of_offset(offset);
-                if line == last_line {
-                    let new_offset =
-                        self.buffer.offset_line_end(offset, mode != Mode::Normal);
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let line_info = self.visual_line_info(line);
+                let last_vline_info = self.last_visual_line_info();
+                if line_info == last_vline_info {
+                    let new_offset = line_info
+                        .line_end_offset(&self.buffer.text(), mode != Mode::Normal);
                     let horiz = horiz.cloned().unwrap_or_else(|| {
                         ColPosition::Col(
-                            self.line_point_of_offset(offset, font_size).x,
+                            self.line_point_of_offset(offset, *affinity, font_size)
+                                .x,
                         )
                     });
+
                     return (new_offset, Some(horiz));
                 }
 
-                let line = line + count;
-
-                let line = line.min(last_line);
+                let line = VisualLine(line.get() + count);
+                let line_info = self.visual_line_info(line);
 
                 let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
                 });
+
                 let col = self.line_horiz_col(
-                    line,
+                    line_info,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
+                *affinity = if col == 0 {
+                    // the column was zero so we shift it to be at the line itself. This lets us
+                    // move down to an empty - for example - next line and appear at the start of
+                    // that line without it coinciding with the offset at the end of the previous
+                    // line
+                    CursorAffinity::Forward
+                } else {
+                    CursorAffinity::Backward
+                };
+
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
+
                 (new_offset, Some(horiz))
             }
-            Movement::DocumentStart => (0, Some(ColPosition::Start)),
+            Movement::DocumentStart => {
+                *affinity = CursorAffinity::Backward;
+                (0, Some(ColPosition::Start))
+            }
             Movement::DocumentEnd => {
                 let last_offset = self
                     .buffer
                     .offset_line_end(self.buffer.len(), mode != Mode::Normal);
+                // so it is past any inlay hint line wraps directly at the end
+                *affinity = CursorAffinity::Forward;
                 (last_offset, Some(ColPosition::End))
             }
             Movement::FirstNonBlank => {
-                let line = self.buffer.line_of_offset(offset);
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let line_info = self.visual_line_info(line);
                 let non_blank_offset =
-                    self.buffer.first_non_blank_character_on_line(line);
-                let start_line_offset = self.buffer.offset_of_line(line);
+                    line_info.first_non_blank_character(&self.buffer.text());
+                let start_line_offset = line_info.interval.start;
+                // TODO: is this always correct? it might not be desirable for the very first character on a wrapped line?
+                *affinity = CursorAffinity::Forward;
                 if offset > non_blank_offset {
                     // Jump to the first non-whitespace character if we're strictly after it
                     (non_blank_offset, Some(ColPosition::FirstNonBlank))
@@ -660,13 +884,23 @@ impl Document {
                 }
             }
             Movement::StartOfLine => {
-                let line = self.buffer.line_of_offset(offset);
-                let new_offset = self.buffer.offset_of_line(line);
+                // TODO: If the line has zero characters, it should probably be forward, but other cases might be better as backwards.
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let new_offset = self.offset_of_visual_line(line);
+                *affinity = CursorAffinity::Forward;
                 (new_offset, Some(ColPosition::Start))
             }
             Movement::EndOfLine => {
-                let new_offset =
-                    self.buffer.offset_line_end(offset, mode != Mode::Normal);
+                let line = self.visual_line_of_offset(offset, *affinity);
+                let line_info = self.visual_line_info(line);
+                let new_col =
+                    line_info.last_col(&self.buffer.text(), mode != Mode::Normal);
+                if new_col == 0 {
+                    *affinity = CursorAffinity::Forward;
+                } else {
+                    *affinity = CursorAffinity::Backward;
+                }
+                let new_offset = self.offset_of_visual_line_col(line_info, new_col);
                 (new_offset, Some(ColPosition::End))
             }
             Movement::Line(position) => {
@@ -677,19 +911,30 @@ impl Document {
                     LinePosition::First => 0,
                     LinePosition::Last => self.buffer.last_line(),
                 };
+                let line = self.visual_line_of_offset(
+                    self.buffer.offset_of_line(line),
+                    CursorAffinity::Backward,
+                );
+                let line_info = self.visual_line_info(line);
+
                 let font_size = config.editor.font_size;
+                // TODO: is this the right affinity?
                 let horiz = horiz.cloned().unwrap_or_else(|| {
-                    ColPosition::Col(self.line_point_of_offset(offset, font_size).x)
+                    ColPosition::Col(
+                        self.line_point_of_offset(offset, *affinity, font_size).x,
+                    )
                 });
                 let col = self.line_horiz_col(
-                    line,
+                    line_info,
                     font_size,
                     &horiz,
                     mode != Mode::Normal,
                 );
-                let new_offset = self.buffer.offset_of_line_col(line, col);
+                // let new_offset = self.buffer.offset_of_line_col(line, col);
+                let new_offset = self.offset_of_visual_line_col(line_info, col);
                 (new_offset, Some(horiz))
             }
+            // TODO: should we force this to give the affinity?
             Movement::Offset(offset) => {
                 let new_offset = *offset;
                 let new_offset = self
@@ -705,6 +950,7 @@ impl Document {
                     count,
                     mode == Mode::Insert,
                 );
+
                 (new_offset, None)
             }
             Movement::WordForward => {
@@ -778,8 +1024,10 @@ impl Document {
     ) {
         match cursor.mode {
             CursorMode::Normal(offset) => {
+                let prev_text = self.buffer.text().clone();
                 let (new_offset, horiz) = self.move_offset(
                     offset,
+                    &mut cursor.affinity,
                     cursor.horiz.as_ref(),
                     count,
                     movement,
@@ -788,6 +1036,7 @@ impl Document {
                 if let Some(motion_mode) = cursor.motion_mode.clone() {
                     let (moved_new_offset, _) = self.move_offset(
                         new_offset,
+                        &mut cursor.affinity,
                         None,
                         1,
                         &Movement::Right,
@@ -815,7 +1064,7 @@ impl Document {
                         movement.is_vertical(),
                         register,
                     );
-                    self.apply_deltas(&deltas);
+                    self.apply_deltas(&prev_text, &deltas);
                     cursor.motion_mode = None;
                 } else {
                     cursor.mode = CursorMode::Normal(new_offset);
@@ -825,6 +1074,7 @@ impl Document {
             CursorMode::Visual { start, end, mode } => {
                 let (new_offset, horiz) = self.move_offset(
                     end,
+                    &mut cursor.affinity,
                     cursor.horiz.as_ref(),
                     count,
                     movement,
@@ -840,6 +1090,7 @@ impl Document {
             CursorMode::Insert(ref selection) => {
                 let selection = self.move_selection(
                     selection,
+                    &mut cursor.affinity,
                     count,
                     modify,
                     movement,
@@ -852,16 +1103,22 @@ impl Document {
 
     /// Returns the point into the text layout of the line at the given offset.
     /// `x` being the leading edge of the character, and `y` being the baseline.
-    pub fn line_point_of_offset(&self, offset: usize, font_size: usize) -> Point {
-        let (line, col) = self.buffer.offset_to_line_col(offset);
-        self.line_point_of_line_col(line, col, font_size)
+    pub fn line_point_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+        font_size: usize,
+    ) -> Point {
+        let (line, col) = self.visual_line_col_of_offset(offset, affinity);
+        let line_info = self.visual_line_info(line);
+        self.line_point_of_line_col(line_info, col, font_size)
     }
 
     /// Returns the point into the text layout of the line at the given line and column.
     /// `x` being the leading edge of the character, and `y` being the baseline.
     pub fn line_point_of_line_col(
         &self,
-        line: usize,
+        line: VisualLineInfo,
         col: usize,
         font_size: usize,
     ) -> Point {
@@ -870,28 +1127,44 @@ impl Document {
     }
 
     /// Get the (point above, point below) of a particular offset within the editor.
-    pub fn points_of_offset(&self, offset: usize) -> (Point, Point) {
-        let (line, col) = self.buffer.offset_to_line_col(offset);
-        self.points_of_line_col(line, col)
+    pub fn points_of_offset(
+        &self,
+        offset: usize,
+        affinity: CursorAffinity,
+    ) -> (Point, Point) {
+        // let (line, col) = self.buffer.offset_to_line_col(offset);
+        let (line, col) = self.lines.visual_line_col_of_offset(
+            &self.buffer.text(),
+            offset,
+            affinity,
+        );
+        let line_info = self.visual_line_info(line);
+        self.points_of_line_col(line_info, col)
     }
 
     /// Get the (point above, point below) of a particular (line, col) within the editor.
-    pub fn points_of_line_col(&self, line: usize, col: usize) -> (Point, Point) {
+    pub fn points_of_line_col(
+        &self,
+        line: VisualLineInfo,
+        col: usize,
+    ) -> (Point, Point) {
         let config = self.config.get_untracked();
         let (y, line_height, font_size) = (
-            config.editor.line_height() * line,
+            config.editor.line_height() * line.vline.get(),
             config.editor.line_height(),
             config.editor.font_size,
         );
 
-        let line = line.min(self.buffer.last_line());
+        // TODO: bound the line? We don't get an *easy* way to get the absolute last line
+        // let line = line.min(self.buffer.last_line());
 
         let phantom_text = self.line_phantom_text(line);
         let col = phantom_text.col_after(col, false);
 
         let mut x_shift = 0.0;
         if font_size < config.editor.font_size {
-            let line_content = self.buffer.line_content(line);
+            // let line_content = self.buffer.line_content(line);
+            let line_content = self.buffer.text().slice_to_cow(line.interval);
             let mut col = 0usize;
             for ch in line_content.chars() {
                 if ch == ' ' || ch == '\t' {
@@ -917,51 +1190,56 @@ impl Document {
         )
     }
 
-    /// Create a new text layout for the given line.  
-    /// Typically you should use [`Document::get_text_layout`] instead.
-    fn new_text_layout(&self, line: usize, _font_size: usize) -> TextLayoutLine {
+    fn new_text_layout(
+        &self,
+        line: VisualLineInfo,
+        _font_size: usize,
+    ) -> TextLayoutLine {
         let config = self.config.get_untracked();
-        let line_content_original = self.buffer.line_content(line);
 
-        // Get the line content with newline characters replaced with spaces
-        // and the content without the newline characters
-        let (line_content, _line_content_original) =
-            if let Some(s) = line_content_original.strip_suffix("\r\n") {
-                (
-                    format!("{s}  "),
-                    &line_content_original[..line_content_original.len() - 2],
-                )
-            } else if let Some(s) = line_content_original.strip_suffix('\n') {
-                (
-                    format!("{s} ",),
-                    &line_content_original[..line_content_original.len() - 1],
-                )
-            } else {
-                (
-                    line_content_original.to_string(),
-                    &line_content_original[..],
-                )
-            };
-        // Combine the phantom text with the line content
+        // The relevant line content for this visual line
+        let iv = line.interval;
+        let (start_line, start_col) = self.buffer.offset_to_line_col(iv.start);
+        let (end_line, _) = self.buffer.offset_to_line_col(iv.end);
+        // TODO: do we want caret or not?
+        let offset_of_line = self.buffer.offset_of_line(start_line);
+        // let end_col = line.last_col(true) + start_col;
+        let end_col = line.interval.end - offset_of_line;
+
+        debug_assert!(start_line == end_line || start_line + 1 == end_line, "visual line interval spans multiple buffer lines, but interval should only span one buffer line. Start: {start_line}; End: {end_line}");
+
+        let line_content = self.buffer.text().slice_to_cow(iv);
+        // TODO: Previously, we would replace \r\n with two spaces and \n with one space, and put no spaces at all for the last. However I think that is unneeded and would have issues with error lens on the last line maybe?
+        let line_content = line_content.trim_end();
+        // Put two spaces at the end of the line to make sure there's a place to put the phantom text
+        let line_content = format!("{}  ", line_content);
+
         let phantom_text = self.line_phantom_text(line);
         let line_content = phantom_text.combine_with_text(line_content);
 
         let color = config.get_color(LapceColor::EDITOR_FOREGROUND);
-        let family: Vec<FamilyOwned> =
+        // TODO: cache this
+        let family: SmallVec<[FamilyOwned; 4]> =
             FamilyOwned::parse_list(&config.editor.font_family).collect();
         let attrs = Attrs::new()
             .color(*color)
             .family(&family)
             .font_size(config.editor.font_size as f32);
+
         let mut attrs_list = AttrsList::new(attrs);
 
         // Apply various styles to the line's text based on our semantic/syntax highlighting
-        let styles = self.line_style(line);
-        for line_style in styles.iter() {
+        let styles = self.line_style(start_line);
+        let styles = styles.iter().filter(|line_style| {
+            line_style.start < end_col && line_style.end > start_col
+        });
+        for line_style in styles {
+            let start = line_style.start.max(start_col) - start_col;
+            let end = line_style.end.min(end_col) - start_col;
             if let Some(fg_color) = line_style.style.fg_color.as_ref() {
                 if let Some(fg_color) = config.get_style_color(fg_color) {
-                    let start = phantom_text.col_at(line_style.start);
-                    let end = phantom_text.col_at(line_style.end);
+                    let start = phantom_text.col_at(start);
+                    let end = phantom_text.col_at(end);
                     attrs_list.add_span(start..end, attrs.color(*fg_color));
                 }
             }
@@ -1034,48 +1312,48 @@ impl Document {
             });
         }
 
-        self.diagnostics.diagnostics.with_untracked(|diags| {
-            for diag in diags {
-                if diag.diagnostic.range.start.line as usize <= line
-                    && line <= diag.diagnostic.range.end.line as usize
-                {
-                    let start = if diag.diagnostic.range.start.line as usize == line
-                    {
-                        let (_, col) = self.buffer.offset_to_line_col(diag.range.0);
-                        col
-                    } else {
-                        let offset =
-                            self.buffer.first_non_blank_character_on_line(line);
-                        let (_, col) = self.buffer.offset_to_line_col(offset);
-                        col
-                    };
-                    let start = phantom_text.col_after(start, true);
+        // self.diagnostics.diagnostics.with_untracked(|diags| {
+        //     for diag in diags {
+        //         if diag.diagnostic.range.start.line as usize <= line
+        //             && line <= diag.diagnostic.range.end.line as usize
+        //         {
+        //             let start = if diag.diagnostic.range.start.line as usize == line
+        //             {
+        //                 let (_, col) = self.buffer.offset_to_line_col(diag.range.0);
+        //                 col
+        //             } else {
+        //                 let offset =
+        //                     self.buffer.first_non_blank_character_on_line(line);
+        //                 let (_, col) = self.buffer.offset_to_line_col(offset);
+        //                 col
+        //             };
+        //             let start = phantom_text.col_after(start, true);
 
-                    let end = if diag.diagnostic.range.end.line as usize == line {
-                        let (_, col) = self.buffer.offset_to_line_col(diag.range.1);
-                        col
-                    } else {
-                        self.buffer.line_end_col(line, true)
-                    };
-                    let end = phantom_text.col_after(end, false);
+        //             let end = if diag.diagnostic.range.end.line as usize == line {
+        //                 let (_, col) = self.buffer.offset_to_line_col(diag.range.1);
+        //                 col
+        //             } else {
+        //                 self.buffer.line_end_col(line, true)
+        //             };
+        //             let end = phantom_text.col_after(end, false);
 
-                    let x0 = text_layout.hit_position(start).point.x;
-                    let x1 = text_layout.hit_position(end).point.x;
-                    let color_name = match diag.diagnostic.severity {
-                        Some(DiagnosticSeverity::ERROR) => LapceColor::LAPCE_ERROR,
-                        _ => LapceColor::LAPCE_WARN,
-                    };
-                    let color = *config.get_color(color_name);
-                    extra_style.push(LineExtraStyle {
-                        x: x0,
-                        width: Some(x1 - x0),
-                        bg_color: None,
-                        under_line: None,
-                        wave_line: Some(color),
-                    });
-                }
-            }
-        });
+        //             let x0 = text_layout.hit_position(start).point.x;
+        //             let x1 = text_layout.hit_position(end).point.x;
+        //             let color_name = match diag.diagnostic.severity {
+        //                 Some(DiagnosticSeverity::ERROR) => LapceColor::LAPCE_ERROR,
+        //                 _ => LapceColor::LAPCE_WARN,
+        //             };
+        //             let color = *config.get_color(color_name);
+        //             extra_style.push(LineExtraStyle {
+        //                 x: x0,
+        //                 width: Some(x1 - x0),
+        //                 bg_color: None,
+        //                 under_line: None,
+        //                 wave_line: Some(color),
+        //             });
+        //         }
+        //     }
+        // });
 
         TextLayoutLine {
             text: text_layout,
@@ -1085,11 +1363,22 @@ impl Document {
         }
     }
 
-    /// Get the text layout for the given line.  
+    /// Get the textlayout of a specific [`VisualLine`].  
+    /// If the text layout is not cached, it will be created and cached.
+    pub fn get_text_layout_with_line(
+        &self,
+        line: VisualLine,
+        font_size: usize,
+    ) -> Arc<TextLayoutLine> {
+        let line_info = self.visual_line_info(line);
+        self.get_text_layout(line_info, font_size)
+    }
+
+    /// Get the text layout for the given [`VisualLineInfo`]
     /// If the text layout is not cached, it will be created and cached.
     pub fn get_text_layout(
         &self,
-        line: usize,
+        line_info: VisualLineInfo,
         font_size: usize,
     ) -> Arc<TextLayoutLine> {
         let config = self.config.get_untracked();
@@ -1109,11 +1398,11 @@ impl Document {
             .layouts
             .get(&font_size)
             .unwrap()
-            .get(&line)
+            .get(&line_info.vline)
             .is_some();
         // If there isn't an entry then we actually have to create it
         if !cache_exists {
-            let text_layout = Arc::new(self.new_text_layout(line, font_size));
+            let text_layout = Arc::new(self.new_text_layout(line_info, font_size));
             let mut cache = self.text_layouts.borrow_mut();
             let width = text_layout.text.size().width;
             if width > cache.max_width {
@@ -1123,7 +1412,7 @@ impl Document {
                 .layouts
                 .get_mut(&font_size)
                 .unwrap()
-                .insert(line, text_layout);
+                .insert(line_info.vline, text_layout);
         }
 
         // Just get the entry, assuming it has been created because we initialize it above.
@@ -1132,7 +1421,7 @@ impl Document {
             .layouts
             .get(&font_size)
             .unwrap()
-            .get(&line)
+            .get(&line_info.vline)
             .cloned()
             .unwrap()
     }
@@ -1280,11 +1569,13 @@ impl Document {
     }
 
     /// Get the phantom text for a given line
-    pub fn line_phantom_text(&self, line: usize) -> PhantomTextLine {
+    pub fn line_phantom_text(&self, line: VisualLineInfo) -> PhantomTextLine {
         let config = self.config.get_untracked();
 
-        let start_offset = self.buffer.offset_of_line(line);
-        let end_offset = self.buffer.offset_of_line(line + 1);
+        // let start_offset = self.buffer.offset_of_line(line);
+        // let end_offset = self.buffer.offset_of_line(line + 1);
+        let start_offset = line.interval.start;
+        let end_offset = line.interval.end;
 
         // If hints are enabled, and the hints field is filled, then get the hints for this line
         // and convert them into PhantomText instances
@@ -1300,7 +1591,11 @@ impl Document {
                 interval.start >= start_offset && interval.start < end_offset
             })
             .map(|(interval, inlay_hint)| {
-                let (_, col) = self.buffer.offset_to_line_col(interval.start);
+                // TODO(minor): This could probalby skip some of the calculation since we know which visual line info it is on!
+                let (_, col) = self.visual_line_col_of_offset(
+                    interval.start,
+                    CursorAffinity::Backward,
+                );
                 let text = match &inlay_hint.label {
                     InlayHintLabel::String(label) => label.to_string(),
                     InlayHintLabel::LabelParts(parts) => {
@@ -1336,8 +1631,26 @@ impl Document {
             .into_iter()
             .flatten()
             .filter(|diag| {
-                diag.diagnostic.range.end.line as usize == line
-                    && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
+                // diag.diagnostic.range.end.line as usize == line.line
+                //     && line.is_last(self.buffer.text())
+                //     && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
+                if diag.diagnostic.severity >= Some(DiagnosticSeverity::HINT) {
+                    return false;
+                }
+
+                let (start, end) = diag.range;
+                let start_line =
+                    self.visual_line_of_offset(start, CursorAffinity::Backward);
+                let end_line =
+                    self.visual_line_of_offset(end, CursorAffinity::Backward);
+
+                if start_line != end_line {
+                    // If the diagnostic spans multiple lines, then we only want to show it on the
+                    // last line
+                    end_line == line.vline
+                } else {
+                    start_line == line.vline
+                }
             })
             .map(|diag| {
                 match (diag.diagnostic.severity, max_severity) {
@@ -1352,9 +1665,7 @@ impl Document {
                     _ => {}
                 }
 
-                let rope_text = self.buffer.rope_text();
-                let col = rope_text.offset_of_line(line + 1)
-                    - rope_text.offset_of_line(line);
+                let col = line.last_col(self.buffer.text(), true);
                 let fg = {
                     let severity = diag
                         .diagnostic

@@ -39,6 +39,7 @@ futures = "0.3.26"
 floem = { path = "../../workspaces/floem" }
 config = { version = "0.13.2", default-features = false, features = ["toml"] }
 structdesc = { git = "https://github.com/lapce/structdesc" }
+xi-unicode = "0.3.0"
 
 [features]
 default = ["all-languages"]

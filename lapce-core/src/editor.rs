@@ -1061,8 +1061,13 @@ impl Editor {
             PasteBefore => {
                 let offset = cursor.offset();
                 let data = register.unnamed.clone();
-                let mut local_cursor =
-                    Cursor::new(CursorMode::Insert(Selection::new()), None, None);
+                // TODO: is this the right affinity to use?
+                let mut local_cursor = Cursor::new(
+                    CursorMode::Insert(Selection::new()),
+                    None,
+                    None,
+                    cursor.affinity,
+                );
                 local_cursor.set_offset(offset, false, false);
                 Self::do_paste(&mut local_cursor, buffer, &data)
             }
@@ -1526,7 +1531,7 @@ enum DuplicateDirection {
 mod test {
     use crate::{
         buffer::Buffer,
-        cursor::{Cursor, CursorMode},
+        cursor::{Cursor, CursorAffinity, CursorMode},
         editor::{DuplicateDirection, Editor},
         selection::{SelRegion, Selection},
     };
@@ -1534,8 +1539,12 @@ mod test {
     #[test]
     fn test_insert_simple() {
         let mut buffer = Buffer::new("abc");
-        let mut cursor =
-            Cursor::new(CursorMode::Insert(Selection::caret(1)), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(Selection::caret(1)),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "e", None, true);
         assert_eq!("aebc", buffer.slice_to_cow(0..buffer.len()));
@@ -1547,7 +1556,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(1));
         selection.add_region(SelRegion::caret(5));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "i", None, true);
         assert_eq!("aibc\neifg\n", buffer.slice_to_cow(0..buffer.len()));
@@ -1559,7 +1573,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(1));
         selection.add_region(SelRegion::caret(5));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "i", None, true);
         assert_eq!("aibc\neifg\n", buffer.slice_to_cow(0..buffer.len()));
@@ -1577,7 +1596,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(1));
         selection.add_region(SelRegion::caret(6));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "{", None, true);
         assert_eq!("a{} bc\ne{} fg\n", buffer.slice_to_cow(0..buffer.len()));
@@ -1591,7 +1615,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::new(0, 4, None));
         selection.add_region(SelRegion::new(5, 9, None));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
         Editor::insert(&mut cursor, &mut buffer, "{", None, true);
         assert_eq!("{a bc}\n{e fg}\n", buffer.slice_to_cow(0..buffer.len()));
     }
@@ -1602,7 +1631,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(1));
         selection.add_region(SelRegion::caret(6));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "{", None, false);
         assert_eq!("a{ bc\ne{ fg\n", buffer.slice_to_cow(0..buffer.len()));
@@ -1615,7 +1649,12 @@ mod test {
         let mut buffer = Buffer::new("first line\nsecond line\n");
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Down);
 
@@ -1631,7 +1670,12 @@ mod test {
         let mut buffer = Buffer::new("first line\nsecond line\n");
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Up);
 
@@ -1648,7 +1692,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
         selection.add_region(SelRegion::caret(1));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Down);
 
@@ -1664,7 +1713,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
         selection.add_region(SelRegion::caret(1));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Up);
 
@@ -1680,7 +1734,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
         selection.add_region(SelRegion::caret(15));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Down);
 
@@ -1696,7 +1755,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(0));
         selection.add_region(SelRegion::caret(15));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Up);
 
@@ -1712,7 +1776,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(15));
         selection.add_region(SelRegion::caret(0));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Down);
 
@@ -1728,7 +1797,12 @@ mod test {
         let mut selection = Selection::new();
         selection.add_region(SelRegion::caret(15));
         selection.add_region(SelRegion::caret(0));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::duplicate_line(&mut cursor, &mut buffer, DuplicateDirection::Up);
 
@@ -1746,7 +1820,12 @@ mod test {
         selection.add_region(SelRegion::caret(4));
         selection.add_region(SelRegion::caret(8));
         selection.add_region(SelRegion::caret(12));
-        let mut cursor = Cursor::new(CursorMode::Insert(selection), None, None);
+        let mut cursor = Cursor::new(
+            CursorMode::Insert(selection),
+            None,
+            None,
+            CursorAffinity::Backward,
+        );
 
         Editor::insert(&mut cursor, &mut buffer, "(", None, true);
 

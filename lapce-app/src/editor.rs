@@ -13,7 +13,7 @@ use floem::{
 use lapce_core::{
     buffer::InvalLines,
     command::{EditCommand, FocusCommand},
-    cursor::{Cursor, CursorMode},
+    cursor::{Cursor, CursorAffinity, CursorMode},
     editor::EditType,
     mode::Mode,
     movement::Movement,
@@ -31,7 +31,7 @@ use crate::{
     command::{CommandExecuted, InternalCommand},
     completion::CompletionStatus,
     db::LapceDb,
-    doc::{DocContent, Document},
+    doc::{DocContent, DocWrap, Document},
     editor::location::{EditorLocation, EditorPosition},
     editor_tab::EditorTabChild,
     find::Find,
@@ -55,6 +55,7 @@ pub enum InlineFindDirection {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EditorInfo {
     pub content: DocContent,
+    pub wrap: DocWrap,
     // pub unsaved: Option<String>,
     pub offset: usize,
     pub scroll_offset: (f64, f64),
@@ -95,7 +96,9 @@ impl EditorInfo {
                 );
                 editor_data
             }
-            DocContent::Local => EditorData::new_local(cx, editor_id, data.common),
+            DocContent::Local => {
+                EditorData::new_local(cx, editor_id, data.common, self.wrap)
+            }
         };
         let editor_data = create_rw_signal(cx, editor_data);
         data.editors.update(|editors| {
@@ -149,6 +152,8 @@ impl EditorData {
             },
             None,
             None,
+            // TODO: is this the right affinity?
+            CursorAffinity::Backward,
         );
         let cursor = create_rw_signal(cx, cursor);
         let scroll_delta = create_rw_signal(cx, Vec2::ZERO);
@@ -180,8 +185,13 @@ impl EditorData {
         }
     }
 
-    pub fn new_local(cx: Scope, editor_id: EditorId, common: CommonData) -> Self {
-        let doc = Document::new_local(cx, common.proxy.clone(), common.config);
+    pub fn new_local(
+        cx: Scope,
+        editor_id: EditorId,
+        common: CommonData,
+        wrap: DocWrap,
+    ) -> Self {
+        let doc = Document::new_local(cx, common.proxy.clone(), common.config, wrap);
         let doc = create_rw_signal(cx, doc);
         Self::new(cx, None, editor_id, doc, common)
     }
@@ -198,6 +208,7 @@ impl EditorData {
         let scroll_offset = self.viewport.get_untracked().origin();
         EditorInfo {
             content: self.doc.get_untracked().content,
+            wrap: self.doc.get_untracked().wrap,
             offset,
             scroll_offset: (scroll_offset.x, scroll_offset.y),
         }
@@ -1282,10 +1293,21 @@ impl EditorData {
             .doc
             .with_untracked(|doc| position.to_offset(doc.buffer()));
         let config = self.common.config.get_untracked();
+        // TODO: are these the right affinities?
         self.cursor.set(if config.core.modal {
-            Cursor::new(CursorMode::Normal(offset), None, None)
+            Cursor::new(
+                CursorMode::Normal(offset),
+                None,
+                None,
+                CursorAffinity::Forward,
+            )
         } else {
-            Cursor::new(CursorMode::Insert(Selection::caret(offset)), None, None)
+            Cursor::new(
+                CursorMode::Insert(Selection::caret(offset)),
+                None,
+                None,
+                CursorAffinity::Forward,
+            )
         });
         if let Some(scroll_offset) = scroll_offset {
             self.scroll_to.set(Some(scroll_offset));

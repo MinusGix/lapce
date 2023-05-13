@@ -33,6 +33,7 @@ use crate::{
     command::{CommandExecuted, CommandKind, InternalCommand, WindowCommand},
     db::LapceDb,
     debug::{run_configs, RunDebugMode},
+    doc::DocWrap,
     editor::{
         location::{EditorLocation, EditorPosition},
         EditorData,
@@ -118,10 +119,18 @@ impl PaletteData {
             },
         );
         let kind = create_rw_signal(cx, PaletteKind::File);
-        let input_editor =
-            EditorData::new_local(cx, EditorId::next(), common.clone());
-        let preview_editor =
-            EditorData::new_local(cx, EditorId::next(), common.clone());
+        let input_editor = EditorData::new_local(
+            cx,
+            EditorId::next(),
+            common.clone(),
+            DocWrap::None,
+        );
+        let preview_editor = EditorData::new_local(
+            cx,
+            EditorId::next(),
+            common.clone(),
+            DocWrap::Editor,
+        );
         let preview_editor = create_rw_signal(cx, preview_editor);
         let has_preview = create_rw_signal(cx, false);
         let run_id = create_rw_signal(cx, 0);

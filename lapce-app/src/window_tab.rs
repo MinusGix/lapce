@@ -13,7 +13,7 @@ use floem::{
     AppContext,
 };
 use itertools::Itertools;
-use lapce_core::{mode::Mode, register::Register};
+use lapce_core::{cursor::CursorAffinity, mode::Mode, register::Register};
 use lapce_rpc::{
     core::CoreNotification, dap_types::RunDebugConfig, proxy::ProxyRpcHandler,
     terminal::TermId,
@@ -845,8 +845,10 @@ impl WindowTabData {
         let (window_origin, viewport, doc) =
             editor.with_untracked(|e| (e.window_origin, e.viewport, e.doc));
 
-        let (point_above, point_below) =
-            doc.with_untracked(|doc| doc.points_of_offset(completion.offset));
+        // TODO: is this the right usage of affinity?
+        let (point_above, point_below) = doc.with_untracked(|doc| {
+            doc.points_of_offset(completion.offset, CursorAffinity::Forward)
+        });
 
         let window_origin = window_origin.get() - self.window_origin.get().to_vec2();
         let viewport = viewport.get();
@@ -895,8 +897,10 @@ impl WindowTabData {
         let (window_origin, viewport, doc) =
             editor.with_untracked(|e| (e.window_origin, e.viewport, e.doc));
 
-        let (_point_above, point_below) =
-            doc.with_untracked(|doc| doc.points_of_offset(code_action.offset));
+        // TODO: is this the right usage of affinity? probably not
+        let (_point_above, point_below) = doc.with_untracked(|doc| {
+            doc.points_of_offset(code_action.offset, CursorAffinity::Forward)
+        });
 
         let window_origin = window_origin.get() - self.window_origin.get().to_vec2();
         let viewport = viewport.get();
