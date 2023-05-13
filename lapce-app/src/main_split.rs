@@ -23,7 +23,7 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    doc::{DiagnosticData, Document, EditorDiagnostic},
+    doc::{DiagnosticData, DocWrap, Document, EditorDiagnostic},
     editor::{
         location::{EditorLocation, EditorPosition},
         EditorData,
@@ -352,6 +352,7 @@ impl MainSplitData {
                 diagnostic_data,
                 self.common.proxy.clone(),
                 self.common.config,
+                DocWrap::Editor,
             );
             let doc = create_rw_signal(cx, doc);
             self.docs.update(|docs| {

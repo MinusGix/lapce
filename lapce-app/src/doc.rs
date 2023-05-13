@@ -49,7 +49,7 @@ use crate::{
 
 use self::{
     phantom_text::{PhantomText, PhantomTextKind, PhantomTextLine},
-    visual_line::{Lines, VisualLine, VisualLineInfo},
+    visual_line::{Lines, VisualLine, VisualLineInfo, WrapStyle},
     width_calc::BasicWidthCalc,
 };
 
@@ -73,6 +73,15 @@ impl Clipboard for SystemClipboard {
     fn put_string(&mut self, s: impl AsRef<str>) {
         Self::clipboard().put_string(s)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocWrap {
+    /// No wrapping whatsoever.  
+    /// Typically used for input boxes.
+    None,
+    /// Use the `config.editor` wrap settings
+    Editor,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +199,7 @@ pub struct Document {
     loaded: bool,
 
     lines: Lines,
+    pub wrap: DocWrap,
 
     /// The ready-to-render text layouts for the document.  
     /// This is an `Rc<RefCell<_>>` due to needing to access it even when the document is borrowed,
@@ -241,6 +251,7 @@ impl Document {
         diagnostics: DiagnosticData,
         proxy: ProxyRpcHandler,
         config: ReadSignal<Arc<LapceConfig>>,
+        wrap: DocWrap,
     ) -> Self {
         let syntax = Syntax::init(&path);
         Self {
@@ -255,6 +266,7 @@ impl Document {
             content: DocContent::File(path),
             loaded: false,
             lines: Lines::default(),
+            wrap,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -266,6 +278,7 @@ impl Document {
         cx: Scope,
         proxy: ProxyRpcHandler,
         config: ReadSignal<Arc<LapceConfig>>,
+        wrap: DocWrap,
     ) -> Self {
         Self {
             buffer_id: BufferId::next(),
@@ -282,6 +295,7 @@ impl Document {
             },
             loaded: true,
             lines: Lines::default(),
+            wrap,
             text_layouts: Rc::new(RefCell::new(TextLayoutCache::new())),
             code_actions: im::HashMap::new(),
             proxy,
@@ -310,9 +324,7 @@ impl Document {
         self.on_update(None);
         self.init_diagnostics();
 
-        let config = self.config.get_untracked();
-        let wrap_style = config.editor.wrap_style();
-        self.lines.set_wrap_style(self.buffer.text(), wrap_style);
+        self.init_wrap();
 
         // This logic should really be done in the editor view. However currently lines is linked to the document.
         let mut width_calc = {
@@ -335,9 +347,24 @@ impl Document {
     pub fn reload(&mut self, content: Rope, set_pristine: bool) {
         // self.code_actions.clear();
         // self.inlay_hints = None;
+        self.init_wrap();
         let prev_text = self.buffer.text().clone();
         let delta = self.buffer.reload(content, set_pristine);
         self.apply_deltas(&prev_text, &[delta]);
+    }
+
+    /// Initialize the line wrapping logic with the appropriate wrap style.  
+    /// This does not perform any wrapping by itself.
+    fn init_wrap(&mut self) {
+        let wrap_style = match self.wrap {
+            DocWrap::None => WrapStyle::None,
+            DocWrap::Editor => {
+                let config = self.config.get_untracked();
+                config.editor.wrap_style()
+            }
+        };
+
+        self.lines.set_wrap_style(self.buffer.text(), wrap_style);
     }
 
     pub fn do_insert(
