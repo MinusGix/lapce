@@ -62,19 +62,22 @@ impl VisualLine {
 
 /// Information about the visual line, giving the interval in the buffer that it covers, and other
 /// data.  
-/// This should *not* be constructed directly, but acquired from functions like
+/// This should *not* be constructed directly, but rather acquired from functions like
 /// [`Document::visual_line_info`], or [`Lines::iter_lines`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisualLineInfo {
-    /// Start offset to end offset in the buffer.
+    /// Start offset to end offset in the buffer that this visual line covers.  
+    /// Can include the newlines.
     pub interval: Interval,
-    /// The buffer line number for this line.
+    /// The line number within the buffer itself.  
+    /// There can be multiple visual lines per buffer line.
     pub line: usize,
     /// Whether this is the first visual line for the buffer line.  
     /// Used for deciding whether to render the line number.
     pub is_first: bool,
+    /// The actual visual line this is for.
     pub vline: VisualLine,
-    // Make so that the struct is not constructable outside of this module.
+    // Ensure that the struct is not constructable outside of this module.
     _marker: (),
 }
 impl VisualLineInfo {
@@ -101,6 +104,7 @@ impl VisualLineInfo {
         line_end == vline_end
     }
 
+    // TODO(minor): more explicit doc comment about the behavior
     /// Get the last column of the visual line.
     pub fn last_col(&self, text: &Rope, caret: bool) -> usize {
         let line_start = self.interval.start;
@@ -236,13 +240,31 @@ impl Lines {
         affinity: CursorAffinity,
     ) -> VisualLine {
         let offset = offset.min(text.len());
-        let mut line = text.line_of_offset(offset);
+        let buffer_line = text.line_of_offset(offset);
+
+        let mut line = buffer_line;
         if self.wrap != WrapStyle::None {
+            // Add all the soft line breaks up to the offset, since we're wrapping
             line += self.breaks.count::<BreaksMetric>(offset);
-            if let CursorAffinity::Backward = affinity {
-                let line_end = self.offset_of_visual_line(text, VisualLine(line));
-                if line_end == offset && line != 0 {
-                    line -= 1;
+
+            // TODO: I think this could be simplified to just consider the current softbreak
+            // boundary?
+
+            // We have to adjust the positioning of the cursor based on affinity if it is at a soft
+            // line break.
+            let Some(prev_soft) = Cursor::new(&self.breaks, offset).at_or_prev::<BreaksMetric>() else {
+                return VisualLine(line);
+            };
+
+            let prev_hard = text.offset_of_line(buffer_line);
+
+            if prev_soft > prev_hard {
+                if let CursorAffinity::Backward = affinity {
+                    let line_end =
+                        self.offset_of_visual_line(text, VisualLine(line));
+                    if line_end == offset && line != 0 {
+                        line -= 1;
+                    }
                 }
             }
         }
@@ -311,9 +333,9 @@ impl Lines {
 
     pub fn last_visual_line(&self, text: &Rope) -> VisualLineInfo {
         // TODO: we may be able to skip ahead more efficiently?
-        // TODO: can this ever actually be empty?
         self.iter_lines(text, VisualLine(0))
             .last()
+            // TODO: can this ever actually be None?
             // Otherwise we forge a line
             .unwrap_or(VisualLineInfo::new(
                 Interval::new(0, 0),
@@ -893,7 +915,7 @@ impl<'a> Iterator for MergedBreaks<'a> {
     }
 }
 
-/// how far away a line can be before we switch to a binary search
+/// How far away a line can be before we switch to a binary search
 const MAX_LINEAR_DIST: usize = 20;
 
 impl<'a> MergedBreaks<'a> {
@@ -1440,6 +1462,71 @@ mod tests {
                 offset
             );
         }
+
+        let text = "blah\n\n\nhi\na b c d e".into();
+        let lines = make_lines(&text, 6.);
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 0, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 1, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 2, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 3, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 4, CursorAffinity::Forward)
+                .get(),
+            0
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 4, CursorAffinity::Backward)
+                .get(),
+            0
+        );
+        // Test that cursor affinity has no effect for hard line breaks
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 5, CursorAffinity::Forward)
+                .get(),
+            1
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 5, CursorAffinity::Backward)
+                .get(),
+            1
+        );
+        // starts at 'd'. Tests that cursor affinity works for soft line breaks
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 16, CursorAffinity::Forward)
+                .get(),
+            5
+        );
+        assert_eq!(
+            lines
+                .visual_line_of_offset(&text, 16, CursorAffinity::Backward)
+                .get(),
+            4
+        );
     }
 
     #[test]
@@ -1559,4 +1646,6 @@ mod tests {
         lines.patchup_tasks(5..90, 80);
         assert_eq!(make_ranges(&lines.work), vec![85..95]);
     }
+
+    // TODO: test that visual line info's interval is always on the same line?
 }
